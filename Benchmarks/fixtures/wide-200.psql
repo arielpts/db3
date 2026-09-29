@@ -1,0 +1,8 @@
+-- psql fixture generator. Copy the generated SELECT into the app's worksheet.
+-- The app deliberately accepts only one extended-protocol statement at a time.
+-- Example: psql -X -At -f Benchmarks/fixtures/wide-200.psql > /tmp/db3-wide.sql
+SELECT 'SELECT ' || string_agg(
+           format('(i + %s)::bigint AS column_%s', c, lpad(c::text, 3, '0')),
+           ', ' ORDER BY c
+       ) || ' FROM generate_series(1, 100000) AS fixture(i);'
+FROM generate_series(1, 200) AS columns(c);

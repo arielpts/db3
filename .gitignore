@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+build/
+DerivedData/
+Vendor/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+Benchmarks/local-*.json
+

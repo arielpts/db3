@@ -1,0 +1,15 @@
+{
+  "postgresql": "PostgreSQL 17.9 (Homebrew)",
+  "architecture": "arm64",
+  "libraries": {
+    "libcom_err.3.0.dylib": "e2a6ca551f8e78698ee1f75326de028fa1f8b3290af2de113eadb6aef5eb1463",
+    "libcrypto.3.dylib": "a12805a18cd5e4f733fa8727b91afa08b587f9da5a760517cd79cb508a3a3f71",
+    "libgssapi_krb5.2.2.dylib": "858331b4c2927aa1f6e8285e3f3019f3f773b92059c22d30fbdba32b1ea45015",
+    "libintl.8.dylib": "0c6d618e75fea85cc3d631e164a71766fba9341d19ce1f723300c52e63037c51",
+    "libk5crypto.3.1.dylib": "004bcd154d90a11a956d143b3e2472e7ddecd9cfc64c6efd577201cd92fe0f3f",
+    "libkrb5.3.3.dylib": "cb033326e03f01bf2cea345a47aa8ec2da5c02b95ae2cb692b7adba561bcac70",
+    "libkrb5support.1.1.dylib": "672b97f5f3c04b54ef0cdfa7cf3b2df795bebb49236d2294a792dd59ff891fc7",
+    "libpq.5.dylib": "2b56abf7161b1b884836e74ea94e8e826f14ce3d420a80b65c179f8bc8a1f277",
+    "libssl.3.dylib": "ffd8ac6981000def0928367924b6cb1e7a98712efbc06e2a2f3f750138bd89ca"
+  }
+}

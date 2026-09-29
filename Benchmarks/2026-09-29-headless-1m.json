@@ -1,0 +1,62 @@
+{
+  "architecture" : "arm64",
+  "batchCount" : 1954,
+  "buildConfiguration" : "Release",
+  "cancellation" : {
+    "recoverySeconds" : 0.001386833,
+    "requestAcknowledgementSeconds" : 0.000170708,
+    "rowsBeforeCancellation" : 0,
+    "sqlState" : "57014",
+    "subsequentQuerySucceeded" : true
+  },
+  "columnCount" : 8,
+  "connectionSeconds" : 0.003863125,
+  "consumerDelayMilliseconds" : 0,
+  "endpointInspectionExercisedEviction" : true,
+  "endpointInspectionSeconds" : 0.000276416,
+  "exactEndpointValuesVerified" : true,
+  "firstBatchReceivedSeconds" : 0.028140208,
+  "firstBatchStoredSeconds" : 0.02979175,
+  "hardware" : "Mac17,2",
+  "limitations" : [
+    "Single headless sample; excludes app launch, grid/editor rendering, input latency, and server process memory.",
+    "Physical footprint and resident set are different OS metrics. Peak values are kernel process-lifetime peaks, not baseline-subtracted allocations.",
+    "ResultStore residentBytes is payload/container accounting, not process memory.",
+    "Server execution and local transport are included in first-batch and stream durations; the consumer's configured delay is included.",
+    "Run Release repeatedly on the stated reference hardware before assessing performance budgets."
+  ],
+  "maxBatchPayloadBytes" : 173211,
+  "maxBatchRows" : 512,
+  "operatingSystem" : "Version 26.5.1 (Build 25F80)",
+  "pages" : 3907,
+  "processMemoryAfterCleanup" : {
+    "physicalFootprintBytes" : 20759056,
+    "physicalFootprintLifetimePeakBytes" : 20840976,
+    "residentSetBytes" : 27410432,
+    "residentSetLifetimePeakBytes" : 27410432
+  },
+  "processMemoryAfterStream" : {
+    "physicalFootprintBytes" : 20677136,
+    "physicalFootprintLifetimePeakBytes" : 20840976,
+    "residentSetBytes" : 27295744,
+    "residentSetLifetimePeakBytes" : 27295744
+  },
+  "processMemoryAtStart" : {
+    "physicalFootprintBytes" : 2081248,
+    "physicalFootprintLifetimePeakBytes" : 2081248,
+    "residentSetBytes" : 7553024,
+    "residentSetLifetimePeakBytes" : 7553024
+  },
+  "requestedRows" : 1000000,
+  "residentByteLimit" : 16777216,
+  "residentBytesAtStreamCompletion" : 16573535,
+  "rowCount" : 1000000,
+  "rowsPerSecond" : 576529.5816247339,
+  "serverVersion" : "17.9 (Homebrew)",
+  "spoolByteLimit" : 536870912,
+  "spooledBytes" : 326699057,
+  "streamAndSpoolSeconds" : 1.734516375,
+  "systemMemoryBytes" : 34359738368,
+  "timestamp" : "2026-09-29T17:00:43Z",
+  "workload" : "generate_series, 8 scalar/text columns, approximately 256 payload bytes per row"
+}

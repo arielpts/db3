@@ -18,6 +18,7 @@ let package = Package(
         .executableTarget(name: "DB3Bench", dependencies: ["DB3Core", "DB3Postgres", "DB3Results"]),
         .testTarget(name: "DB3CoreTests", dependencies: ["DB3Core", "DB3Postgres", "DB3Results"]),
         .testTarget(name: "DB3GridTests", dependencies: ["DB3Grid"]),
+        .testTarget(name: "DB3EditorTests", dependencies: ["DB3Editor"]),
     ],
     swiftLanguageModes: [.v6]
 )

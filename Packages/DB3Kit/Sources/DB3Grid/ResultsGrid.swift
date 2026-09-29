@@ -7,11 +7,14 @@ import SwiftUI
 /// A virtualized native table. The loader must return rows in the requested order.
 /// Increment revision when replacing a result; changing rowCount appends rows to
 /// the current result without discarding already displayed pages.
+/// Retain this view's identity and set isActive to false while its tab or output
+/// pane is hidden. Native presentation state survives; background reads pause.
 @MainActor
 public struct ResultsGrid: NSViewRepresentable {
     private let columns: [DatabaseColumn]
     private let rowCount: Int
     private let revision: Int
+    private let isActive: Bool
     private let loadRows: @Sendable (Range<Int>) async throws -> [DatabaseRow]
     private let onSelect: (@MainActor (Int, DatabaseColumn, DatabaseValue) -> Void)?
 
@@ -19,12 +22,14 @@ public struct ResultsGrid: NSViewRepresentable {
         columns: [DatabaseColumn],
         rowCount: Int,
         revision: Int,
+        isActive: Bool = true,
         loadRows: @escaping @Sendable (Range<Int>) async throws -> [DatabaseRow],
         onSelect: (@MainActor (Int, DatabaseColumn, DatabaseValue) -> Void)? = nil
     ) {
         self.columns = columns
         self.rowCount = max(0, rowCount)
         self.revision = revision
+        self.isActive = isActive
         self.loadRows = loadRows
         self.onSelect = onSelect
     }
@@ -100,6 +105,7 @@ public struct ResultsGrid: NSViewRepresentable {
         private var headerCompletionTask: Task<Void, Never>?
         private var columnLayoutTask: Task<Void, Never>?
         private var headerWidths: [Double] = []
+        private var headersMeasured = false
         private var contentWidths: [Double] = []
         private var sampledRowPages: [Int?] = []
         private var sampledRowCounts: [Int] = []
@@ -111,10 +117,15 @@ public struct ResultsGrid: NSViewRepresentable {
         private var selectedColumn = 0
         private var generation = 0
         private var isStopped = false
+        private var needsResultReset = false
+        private var displayedRowCount: Int
         private static let byteLimit = 4 * 1_024 * 1_024
         private static let tileLimit = 12
 
-        fileprivate init(parent: ResultsGrid) { self.parent = parent }
+        fileprivate init(parent: ResultsGrid) {
+            self.parent = parent
+            displayedRowCount = parent.rowCount
+        }
 
         fileprivate func attach(table: NSTableView, scroll: NSScrollView) {
             self.table = table
@@ -132,14 +143,22 @@ public struct ResultsGrid: NSViewRepresentable {
 
         func update(parent: ResultsGrid) {
             let reset = self.parent.revision != parent.revision || self.parent.columns != parent.columns || parent.rowCount < self.parent.rowCount
-            let previousCount = self.parent.rowCount
+            let wasActive = self.parent.isActive
             self.parent = parent
-            guard let table else { return }
-            if reset {
+            needsResultReset = needsResultReset || reset
+            if wasActive && !parent.isActive { cancelWork() }
+            // Keep native selection, widths, and scroll untouched while hidden.
+            // A background query may replace/append its result; apply only its
+            // latest presentation when the owning worksheet becomes visible.
+            guard !isStopped, parent.isActive, let table else { return }
+            let previousCount = displayedRowCount
+            displayedRowCount = parent.rowCount
+            if needsResultReset {
                 invalidate()
                 rebuildColumns()
                 table.deselectAll(nil)
                 table.reloadData()
+                needsResultReset = false
             } else if parent.rowCount != previousCount {
                 // A partially filled tail page must be refetched when more rows
                 // arrive. Complete pages keep their stable row identities.
@@ -149,6 +168,7 @@ public struct ResultsGrid: NSViewRepresentable {
                 table.noteNumberOfRowsChanged()
                 if String(previousCount).count != String(parent.rowCount).count { columnLayoutDirty = true }
             }
+            measureHeaders()
             scheduleColumnLayout()
             enqueueViewport()
         }
@@ -159,6 +179,7 @@ public struct ResultsGrid: NSViewRepresentable {
             defer { isApplyingColumnWidths = false }
             let count = parent.columns.count
             headerWidths = parent.columns.map { min(320, max(64, Double($0.name.utf16.prefix(64).count) * 7 + 20)) }
+            headersMeasured = false
             contentWidths = Array(repeating: 64, count: count)
             sampledRowPages = Array(repeating: nil, count: count)
             sampledRowCounts = Array(repeating: 0, count: count)
@@ -189,7 +210,7 @@ public struct ResultsGrid: NSViewRepresentable {
         }
 
         private func measureHeaders() {
-            guard let table else { return }
+            guard !isStopped, parent.isActive, !headersMeasured, headerTask == nil, let table else { return }
             let names = parent.columns.map { String(decoding: $0.name.utf16.prefix(128), as: UTF16.self) }
             let font = table.tableColumns.first?.headerCell.font ?? NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
             let fontSize = font.pointSize
@@ -201,8 +222,9 @@ public struct ResultsGrid: NSViewRepresentable {
             headerTask = work
             headerCompletionTask = Task { [weak self] in
                 let widths = await work.value
-                guard !Task.isCancelled, let self, !self.isStopped, self.generation == expectedGeneration else { return }
+                guard !Task.isCancelled, let self, !self.isStopped, self.parent.isActive, self.generation == expectedGeneration else { return }
                 self.headerWidths = widths
+                self.headersMeasured = true
                 self.headerTask = nil
                 self.headerCompletionTask = nil
                 self.columnLayoutDirty = true
@@ -211,7 +233,7 @@ public struct ResultsGrid: NSViewRepresentable {
         }
 
         private func scheduleColumnLayout() {
-            guard !isStopped, !isApplyingColumnWidths, let clipView else { return }
+            guard !isStopped, parent.isActive, !isApplyingColumnWidths, let clipView else { return }
             let width = Double(clipView.bounds.width)
             guard width > 0, columnLayoutDirty || abs(width - lastViewportWidth) >= 0.5,
                   columnLayoutTask == nil else { return }
@@ -220,14 +242,14 @@ public struct ResultsGrid: NSViewRepresentable {
             let expectedGeneration = generation
             columnLayoutTask = Task { [weak self] in
                 do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
-                guard !Task.isCancelled, let self, !self.isStopped, self.generation == expectedGeneration else { return }
+                guard !Task.isCancelled, let self, !self.isStopped, self.parent.isActive, self.generation == expectedGeneration else { return }
                 self.columnLayoutTask = nil
                 self.applyColumnWidths()
             }
         }
 
         private func applyColumnWidths() {
-            guard let table, let clipView, table.tableColumns.count == parent.columns.count + 1 else { return }
+            guard !isStopped, parent.isActive, let table, let clipView, table.tableColumns.count == parent.columns.count + 1 else { return }
             let viewport = Double(clipView.bounds.width)
             guard viewport.isFinite, viewport > 0 else { return }
             let numberWidth = min(120.0, max(48, Double(String(max(1, parent.rowCount)).count) * 8 + 20))
@@ -270,7 +292,7 @@ public struct ResultsGrid: NSViewRepresentable {
         }
 
         public func tableViewColumnDidResize(_ notification: Notification) {
-            guard !isApplyingColumnWidths, !isStopped, let table,
+            guard !isApplyingColumnWidths, !isStopped, parent.isActive, let table,
                   let column = notification.userInfo?["NSTableColumn"] as? NSTableColumn,
                   let index = table.tableColumns.firstIndex(of: column), index > 0 else { return }
             manualWidths[index - 1] = column.width
@@ -282,7 +304,7 @@ public struct ResultsGrid: NSViewRepresentable {
             guard tableView.tableColumns.indices.contains(column) else { return 0 }
             let target = tableView.tableColumns[column]
             let position = column - 1
-            guard !isStopped, tableView === table, parent.columns.indices.contains(position) else { return target.width }
+            guard !isStopped, parent.isActive, tableView === table, parent.columns.indices.contains(position) else { return target.width }
 
             // AppKit identifies the column to the left of the double-clicked
             // divider. Reuse its bounded background measurements; never scan
@@ -298,7 +320,7 @@ public struct ResultsGrid: NSViewRepresentable {
             return fitted
         }
 
-        public func numberOfRows(in tableView: NSTableView) -> Int { parent.rowCount }
+        public func numberOfRows(in tableView: NSTableView) -> Int { displayedRowCount }
 
         public func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
             guard let tableColumn, row >= 0, row < parent.rowCount else { return nil }
@@ -334,7 +356,8 @@ public struct ResultsGrid: NSViewRepresentable {
 
         private func inspectSelection() {
             selectionTask?.cancel()
-            guard let table, table.selectedRow >= 0,
+            selectionTask = nil
+            guard !isStopped, parent.isActive, let table, table.selectedRow >= 0,
                   parent.columns.indices.contains(selectedColumn), let callback = parent.onSelect else { return }
             let row = table.selectedRow
             let position = selectedColumn
@@ -345,8 +368,9 @@ public struct ResultsGrid: NSViewRepresentable {
             // bounded previews rather than duplicate entire large fields.
             selectionTask = Task { [weak self] in
                 do {
+                    try Task.checkCancellation()
                     let rows = try await loader(row..<(row + 1))
-                    guard !Task.isCancelled, let self, self.generation == expectedGeneration,
+                    guard !Task.isCancelled, let self, !self.isStopped, self.parent.isActive, self.generation == expectedGeneration,
                           let result = rows.first, result.indices.contains(position) else { return }
                     callback(row, column, result[position])
                 } catch { /* The grid continues to show the cached preview. */ }
@@ -360,7 +384,7 @@ public struct ResultsGrid: NSViewRepresentable {
         }
 
         private func enqueueViewport() {
-            guard let table, parent.rowCount > 0 else { return }
+            guard !isStopped, parent.isActive, let table, parent.rowCount > 0 else { return }
             let rows = table.rows(in: table.visibleRect)
             guard rows.location != NSNotFound else { return }
             let lower = max(0, rows.location)
@@ -381,14 +405,14 @@ public struct ResultsGrid: NSViewRepresentable {
         }
 
         private func enqueue(_ key: TileKey) {
-            guard !isStopped, cache[key] == nil, !failed.contains(key), loadingKey != key,
+            guard !isStopped, parent.isActive, cache[key] == nil, !failed.contains(key), loadingKey != key,
                   !pending.contains(key), pending.count < 16 else { return }
             pending.append(key)
             startNextLoad()
         }
 
         private func startNextLoad() {
-            guard !isStopped, loadingKey == nil, !pending.isEmpty else { return }
+            guard !isStopped, parent.isActive, loadingKey == nil, !pending.isEmpty else { return }
             let key = pending.removeFirst()
             let end = min(parent.rowCount, key.rowStart + TileKey.rowsPerTile)
             guard key.rowStart < end else { startNextLoad(); return }
@@ -403,6 +427,7 @@ public struct ResultsGrid: NSViewRepresentable {
             }
             let fontName = valueFontName
             let work = Task.detached(priority: .userInitiated) {
+                try Task.checkCancellation()
                 let rows = try await loader(key.rowStart..<end)
                 try Task.checkCancellation()
                 return PreparedTile(key: key, rows: rows, columnCount: columnCount, widthRequests: requests, fontName: fontName)
@@ -411,7 +436,7 @@ public struct ResultsGrid: NSViewRepresentable {
             completionTask = Task { [weak self] in
                 do {
                     let tile = try await work.value
-                    guard !Task.isCancelled, let self, self.generation == expectedGeneration else { return }
+                    guard !Task.isCancelled, let self, !self.isStopped, self.parent.isActive, self.generation == expectedGeneration else { return }
                     if end < self.parent.rowCount, end < key.rowStart + TileKey.rowsPerTile {
                         // Appends may race an in-flight tail-page read. Fetch its
                         // new range instead of caching an already stale tail.
@@ -422,12 +447,12 @@ public struct ResultsGrid: NSViewRepresentable {
                         self.reload(tile: key, count: tile.rows.count)
                     }
                 } catch {
-                    guard !Task.isCancelled, let self, self.generation == expectedGeneration else { return }
+                    guard !Task.isCancelled, let self, !self.isStopped, self.parent.isActive, self.generation == expectedGeneration else { return }
                     if self.failed.count >= 16 { self.failed.removeAll() }
                     self.failed.insert(key)
                     self.reload(tile: key, count: end - key.rowStart)
                 }
-                guard let self, self.generation == expectedGeneration else { return }
+                guard !Task.isCancelled, let self, !self.isStopped, self.parent.isActive, self.generation == expectedGeneration else { return }
                 self.loadingKey = nil
                 self.loadTask = nil
                 self.completionTask = nil
@@ -481,6 +506,16 @@ public struct ResultsGrid: NSViewRepresentable {
         }
 
         private func invalidate() {
+            cancelWork()
+            cache.removeAll()
+            recency.removeAll()
+            failed.removeAll()
+            residentBytes = 0
+        }
+
+        // Increment the fence before cancelling: loaders may ignore cancellation
+        // and return after a later activation has started work for the same tile.
+        private func cancelWork() {
             generation &+= 1
             loadTask?.cancel()
             completionTask?.cancel()
@@ -495,11 +530,7 @@ public struct ResultsGrid: NSViewRepresentable {
             headerCompletionTask = nil
             columnLayoutTask = nil
             loadingKey = nil
-            cache.removeAll()
-            recency.removeAll()
             pending.removeAll()
-            failed.removeAll()
-            residentBytes = 0
         }
 
         fileprivate func stop() {

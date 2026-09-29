@@ -9,17 +9,25 @@ public struct SQLTextEditor: NSViewRepresentable {
     @Binding private var selection: NSRange
     private let fontSize: CGFloat
     private let isEditable: Bool
+    private let isActive: Bool
 
-    public init(text: Binding<String>, selection: Binding<NSRange>, fontSize: CGFloat = 13, isEditable: Bool = true) {
+    public init(text: Binding<String>, selection: Binding<NSRange>, fontSize: CGFloat = 13, isEditable: Bool = true, isActive: Bool = true) {
         _text = text
         _selection = selection
         self.fontSize = fontSize
         self.isEditable = isEditable
+        self.isActive = isActive
     }
 
     public func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     public func makeNSView(context: Context) -> NSScrollView {
+        makeScrollView(coordinator: context.coordinator)
+    }
+
+    /// Kept separate from the SwiftUI context so native document lifetime can be
+    /// verified in offscreen tests without opening a window.
+    func makeScrollView(coordinator: Coordinator) -> NSScrollView {
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
@@ -28,7 +36,7 @@ public struct SQLTextEditor: NSViewRepresentable {
         scroll.backgroundColor = .textBackgroundColor
         scroll.borderType = .noBorder
 
-        let editor = NSTextView(usingTextLayoutManager: true)
+        let editor = SQLDocumentTextView(usingTextLayoutManager: true)
         editor.isEditable = isEditable
         editor.isRichText = false
         editor.importsGraphics = false
@@ -55,38 +63,17 @@ public struct SQLTextEditor: NSViewRepresentable {
         editor.textContainer?.widthTracksTextView = false
         editor.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         editor.setAccessibilityLabel(isEditable ? "SQL worksheet" : "Result value")
-        editor.setAccessibilityHelp("Edit a single PostgreSQL statement. Select text to execute only that selection.")
+        editor.setAccessibilityHelp("Run executes the statement at the cursor. Highlight SQL to execute that selection instead.")
         editor.string = text
         editor.setSelectedRange(clampedSelection(selection, length: editor.textStorage?.length ?? 0))
-        editor.delegate = context.coordinator
+        editor.delegate = coordinator
         scroll.documentView = editor
-        context.coordinator.attach(editor: editor, scroll: scroll)
+        coordinator.attach(editor: editor, scroll: scroll)
         return scroll
     }
 
     public func updateNSView(_ scroll: NSScrollView, context: Context) {
-        let coordinator = context.coordinator
-        coordinator.parent = self
-        guard let editor = scroll.documentView as? NSTextView else { return }
-        editor.isEditable = isEditable
-        // The common typing path matches the String just sent to SwiftUI. A
-        // character edit never replaces the attributed document in the view.
-        if text != coordinator.lastPublishedText, !editor.hasMarkedText() {
-            coordinator.isApplyingExternalChange = true
-            editor.string = text
-            coordinator.lastPublishedText = text
-            coordinator.revision &+= 1
-            editor.setSelectedRange(clampedSelection(selection, length: editor.textStorage?.length ?? 0))
-            coordinator.isApplyingExternalChange = false
-            coordinator.scheduleHighlight()
-        }
-        if !editor.hasMarkedText() {
-            let range = clampedSelection(selection, length: editor.textStorage?.length ?? 0)
-            if editor.selectedRange() != range { editor.setSelectedRange(range) }
-        }
-        if editor.font?.pointSize != fontSize {
-            editor.font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
-        }
+        context.coordinator.update(parent: self)
     }
 
     public static func dismantleNSView(_ view: NSScrollView, coordinator: Coordinator) {
@@ -107,6 +94,7 @@ public struct SQLTextEditor: NSViewRepresentable {
         private var changedLocation: Int?
         private var highlightedRevision = -1
         private var highlightedRange = NSRange(location: 0, length: 0)
+        private var isStopped = false
 
         fileprivate init(parent: SQLTextEditor) {
             self.parent = parent
@@ -118,13 +106,51 @@ public struct SQLTextEditor: NSViewRepresentable {
             clipView = scroll.contentView
             scroll.contentView.postsBoundsChangedNotifications = true
             NotificationCenter.default.addObserver(self, selector: #selector(viewportChanged), name: NSView.boundsDidChangeNotification, object: scroll.contentView)
+            // A document-owned manager can undo native text storage without
+            // sending textDidChange through a window's text editing machinery.
+            // Publish after either undo path so SQL and dirty state stay current.
+            NotificationCenter.default.addObserver(self, selector: #selector(undoOrRedoCompleted), name: .NSUndoManagerDidUndoChange, object: editor.undoManager)
+            NotificationCenter.default.addObserver(self, selector: #selector(undoOrRedoCompleted), name: .NSUndoManagerDidRedoChange, object: editor.undoManager)
             scheduleHighlight()
         }
 
         fileprivate func stop() {
+            isStopped = true
             debounce?.cancel()
             syntaxTask?.cancel()
+            editor?.undoManager?.removeAllActions()
             NotificationCenter.default.removeObserver(self)
+        }
+
+        func update(parent: SQLTextEditor) {
+            let activityChanged = self.parent.isActive != parent.isActive || self.parent.isEditable != parent.isEditable
+            self.parent = parent
+            guard !isStopped, let editor else { return }
+            editor.isEditable = parent.isEditable
+            editor.allowsUndo = parent.isEditable
+            // The typing roundtrip matches lastPublishedText and leaves native
+            // text storage and undo untouched. A different String is an explicit
+            // document load/reset, whose prior undo history must not survive.
+            if parent.text != lastPublishedText, !editor.hasMarkedText() {
+                isApplyingExternalChange = true
+                editor.breakUndoCoalescing()
+                editor.undoManager?.removeAllActions()
+                editor.string = parent.text
+                editor.undoManager?.removeAllActions()
+                lastPublishedText = parent.text
+                revision &+= 1
+                editor.setSelectedRange(clampedSelection(parent.selection, length: editor.textStorage?.length ?? 0))
+                isApplyingExternalChange = false
+                scheduleHighlight()
+            }
+            if !editor.hasMarkedText() {
+                let range = clampedSelection(parent.selection, length: editor.textStorage?.length ?? 0)
+                if editor.selectedRange() != range { editor.setSelectedRange(range) }
+            }
+            if editor.font?.pointSize != parent.fontSize {
+                editor.font = .monospacedSystemFont(ofSize: parent.fontSize, weight: .regular)
+            }
+            if activityChanged { scheduleHighlight() }
         }
 
         public func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
@@ -133,7 +159,8 @@ public struct SQLTextEditor: NSViewRepresentable {
         }
 
         public func textDidChange(_ notification: Notification) {
-            guard !isApplyingExternalChange, let editor else { return }
+            guard !isStopped, !isApplyingExternalChange, let editor else { return }
+            guard editor.string != lastPublishedText else { return }
             revision &+= 1
             // One plain String is the document model. Attributed text and token
             // arrays are never copied into observable state.
@@ -144,20 +171,24 @@ public struct SQLTextEditor: NSViewRepresentable {
         }
 
         public func textViewDidChangeSelection(_ notification: Notification) {
-            guard !isApplyingExternalChange, let editor else { return }
+            guard !isStopped, !isApplyingExternalChange, let editor else { return }
             let selection = editor.selectedRange()
             if parent.selection != selection { parent.selection = selection }
         }
 
         @objc private func viewportChanged(_ notification: Notification) { scheduleHighlight() }
+        @objc private func undoOrRedoCompleted(_ notification: Notification) { textDidChange(notification) }
 
         fileprivate func scheduleHighlight() {
             debounce?.cancel()
             syntaxTask?.cancel()
-            guard parent.isEditable else { return }
+            debounce = nil
+            syntaxTask = nil
+            guard !isStopped, parent.isEditable, parent.isActive else { return }
             debounce = Task { [weak self] in
                 do { try await Task.sleep(for: .milliseconds(90)) } catch { return }
-                guard let self, let editor = self.editor, !editor.hasMarkedText(), let storage = editor.textStorage else { return }
+                guard let self, !self.isStopped, self.parent.isActive,
+                      let editor = self.editor, !editor.hasMarkedText(), let storage = editor.textStorage else { return }
                 // Huge documents remain editable, with plain text and deferred
                 // analysis. Even ordinary highlighting copies at most 24 Ki UTF-16.
                 guard storage.length > 0, storage.length <= 2 * 1_024 * 1_024 else { return }
@@ -178,6 +209,7 @@ public struct SQLTextEditor: NSViewRepresentable {
                 self.syntaxTask = work
                 let tokens = await work.value
                 guard !Task.isCancelled, !work.isCancelled,
+                      !self.isStopped, self.parent.isActive,
                       self.revision == currentRevision, !editor.hasMarkedText(),
                       NSMaxRange(range) <= storage.length else { return }
                 // Attribute-only edits are bounded and never change characters or
@@ -195,6 +227,15 @@ public struct SQLTextEditor: NSViewRepresentable {
             }
         }
     }
+}
+
+/// NSTextView normally inherits the window's undo manager. Retained tabs share
+/// a window but are different documents, so each editor supplies its own manager
+/// to AppKit's ordinary responder-chain undo/redo commands.
+@MainActor
+private final class SQLDocumentTextView: NSTextView {
+    private let documentUndoManager = UndoManager()
+    override var undoManager: UndoManager? { documentUndoManager }
 }
 
 private func clampedSelection(_ range: NSRange, length: Int) -> NSRange {

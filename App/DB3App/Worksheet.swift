@@ -24,7 +24,24 @@ private actor ProgressRelay {
 final class Worksheet: Identifiable {
     let id = UUID()
     var title: String
-    var sql = "-- Write a query, or select a statement to run.\nSELECT current_database(), current_user, version();"
+    static let starterSQL = "-- Write a query, or select a statement to run.\nSELECT current_database(), current_user, version();"
+    var sql = Worksheet.starterSQL {
+        didSet { if oldValue != sql { documentRevision &+= 1 } }
+    }
+    private(set) var documentRevision: UInt64 = 0
+    private(set) var savedSQL = Worksheet.starterSQL
+    private(set) var fileURL: URL?
+    private(set) var isLoading = false
+    private(set) var isSaving = false
+    private(set) var loadGeneration = UUID()
+    var isDirty: Bool { sql != savedSQL }
+    var resultTab = 0
+    var inspectorSelection = NSRange(location: 0, length: 0)
+    var queryContext: QueryOpeningContext?
+    var isClosePending = false
+    private(set) var isClosing = false
+    var canIssueCommands: Bool { !isClosed && !isClosing && !isLoading && !isClosePending }
+    private(set) var connectionIntent = UUID()
     var selection = NSRange(location: 0, length: 0)
     var profile: ConnectionProfile?
     var columns: [DatabaseColumn] = []
@@ -39,7 +56,9 @@ final class Worksheet: Identifiable {
     var transaction: TransactionState = .unknown
     var serverVersion = ""
     var elapsed: TimeInterval = 0
-    var selectedValue: String?
+    var selectedValue: String? {
+        didSet { if oldValue != selectedValue { inspectorSelection = NSRange(location: 0, length: 0) } }
+    }
     var selectedColumn: String?
     var error: String?
     var resultIncomplete = false
@@ -47,19 +66,82 @@ final class Worksheet: Identifiable {
     private(set) var isClosed = false
     // Four worksheet slots divide the application budget rather than multiplying it.
     @ObservationIgnored var store = Worksheet.makeStore(allowsSpooling: true)
-    @ObservationIgnored private var session: any DatabaseSession = PostgresSession()
+    @ObservationIgnored private var session: any DatabaseSession
+    @ObservationIgnored private let sessionFactory: @Sendable (Bool) -> any DatabaseSession
+    @ObservationIgnored private var closeTask: Task<Void, Never>?
     @ObservationIgnored private var operation: Task<Void, Never>?
     @ObservationIgnored private var generation = UUID()
 
-    init(title: String = "Query 1") { self.title = title }
+    init(title: String = "Query 1", sessionFactory: @escaping @Sendable (Bool) -> any DatabaseSession = { demo in
+        if demo { return DemoSession() }
+        return PostgresSession()
+    }) {
+        self.title = title
+        self.sessionFactory = sessionFactory
+        self.session = sessionFactory(false)
+    }
+
+    func setGeneratedSQL(_ text: String) { savedSQL = ""; sql = text; selection = NSRange(location: 0, length: 0) }
+    func workspaceSnapshot() -> WorkspaceTabSnapshot {
+        WorkspaceTabSnapshot(title: title, sql: sql, savedSQL: savedSQL, fileURL: fileURL,
+            selectionLocation: selection.location, selectionLength: selection.length, profile: profile,
+            database: queryContext?.database, schema: queryContext?.schema, object: queryContext?.object,
+            allowsSpooling: allowsSpooling, resultTab: resultTab, isDemo: isDemo)
+    }
+    func restoreWorkspace(_ snapshot: WorkspaceTabSnapshot) {
+        title = snapshot.title; sql = snapshot.sql; savedSQL = snapshot.savedSQL; fileURL = snapshot.fileURL
+        selection = NSRange(location: snapshot.selectionLocation, length: snapshot.selectionLength)
+        profile = snapshot.profile; allowsSpooling = snapshot.allowsSpooling; resultTab = snapshot.resultTab
+        isDemo = snapshot.isDemo
+        queryContext = QueryOpeningContext(profile: snapshot.profile, database: snapshot.database,
+            schema: snapshot.schema, object: snapshot.object)
+        status = "Restored · Not connected"
+        message = "Your SQL was restored. Connect when you're ready; previous results and database transactions are not restored."
+    }
+    func beginLoading(from url: URL) -> UUID {
+        loadGeneration = UUID(); isLoading = true; fileURL = url
+        sql = ""; savedSQL = ""; selection = NSRange(location: 0, length: 0); status = "Loading SQL…"
+        return loadGeneration
+    }
+    func completeLoading(_ text: String, token: UUID, revision: UInt64) -> Bool {
+        guard token == loadGeneration, documentRevision == revision, !isClosed, !isClosing else { return false }
+        sql = text; savedSQL = text; isLoading = false; status = "Not connected"
+        return true
+    }
+    func failLoading(_ failure: Error, token: UUID) {
+        guard token == loadGeneration, !isClosed, !isClosing else { return }
+        isLoading = false; fileURL = nil; error = failure.localizedDescription; status = "Unable to open SQL"
+    }
+    func beginSaving() -> Bool {
+        guard !isClosed, !isClosing, !isLoading, !isSaving else { return false }
+        isSaving = true; return true
+    }
+    func finishSaving() { isSaving = false }
+    func didSave(_ text: String, to url: URL) {
+        guard !isClosed, !isClosing else { return }
+        savedSQL = text; fileURL = url; title = url.lastPathComponent
+    }
+    /// Allocate before any Keychain read or modal edit. A later intent supersedes this one.
+    func beginConnectionIntent() -> UUID? {
+        guard canIssueCommands, !isBusy, transaction != .inTransaction, transaction != .failed else { return nil }
+        connectionIntent = UUID(); return connectionIntent
+    }
+    func acceptsConnectionIntent(_ token: UUID) -> Bool { canIssueCommands && connectionIntent == token && !isBusy && transaction != .inTransaction && transaction != .failed }
+    func invalidateConnectionIntent() { connectionIntent = UUID() }
+    var activityGeneration: UUID { generation }
     private static func makeStore(allowsSpooling: Bool) -> ResultStore {
         ResultStore(configuration: .init(residentByteLimit: 16 * 1_024 * 1_024, spoolByteLimit: 1_024 * 1_024 * 1_024, sharedSpoolBudget: spoolBudget, allowsSpooling: allowsSpooling, maximumBatchBytes: 2 * 1_024 * 1_024))
     }
 
-    func connect(_ profile: ConnectionProfile, password: String, demo: Bool = false) {
-        guard !isClosed, !isBusy else { return }
+    func connect(_ profile: ConnectionProfile, password: String, demo: Bool = false, intent: UUID? = nil) {
+        guard canIssueCommands, !isBusy else { return }
+        if let intent { guard acceptsConnectionIntent(intent) else { return } }
+        else { invalidateConnectionIntent() }
         guard transaction != .inTransaction, transaction != .failed else { error = "Commit or roll back before changing connections."; return }
         let token = UUID(); generation = token
+        if queryContext?.profile != profile || queryContext?.database != profile.database {
+            queryContext = QueryOpeningContext(profile: profile)
+        }
         isBusy = true; error = nil; status = "Connecting…"; self.profile = profile
         operation = Task {
             defer { if generation == token { isBusy = false; isCancelling = false; operation = nil } }
@@ -68,7 +150,7 @@ final class Worksheet: Identifiable {
                 isConnected = false
                 try Task.checkCancellation()
                 guard generation == token, !isClosed else { return }
-                session = demo ? DemoSession() : PostgresSession()
+                session = sessionFactory(demo)
                 let info = try await session.connect(profile: profile, password: password)
                 guard generation == token, !isClosed else { return }
                 isConnected = true; isDemo = demo; serverVersion = info.serverVersion; transaction = .idle
@@ -79,23 +161,42 @@ final class Worksheet: Identifiable {
     }
 
     func run(sql override: String? = nil) {
-        guard !isClosed, isConnected, !isBusy else { return }
-        let text = sql as NSString
-        let statement = override ?? (selection.length > 0 && NSMaxRange(selection) <= text.length ? text.substring(with: selection) : sql)
-        guard !statement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        isBusy = true; isCancelling = false; error = nil; resultIncomplete = true
-        status = "Executing…"; message = "Waiting for PostgreSQL…"; rowCount = 0; columns = []; elapsed = 0
-        selectedValue = nil; selectedColumn = nil; revision += 1
+        guard canIssueCommands, isConnected, !isBusy else { return }
+        let document = sql, selectedRange = selection
+        isBusy = true; isCancelling = false; error = nil
+        status = "Preparing statement…"
         let token = UUID(); generation = token
-        let source = session; let oldStore = store
-        let resultStore = Self.makeStore(allowsSpooling: allowsSpooling)
-        store = resultStore
-        let relay = ProgressRelay()
-        events.info("Query submitted")
-        let interval = signposter.beginInterval("ExecuteAndStore")
+        let source = session
         operation = Task {
-            defer { signposter.endInterval("ExecuteAndStore", interval) }
+            var executingStore: ResultStore?
+            defer {
+                if generation == token { isBusy = false; isCancelling = false; operation = nil }
+            }
             do {
+                let parsing = Task.detached(priority: .userInitiated) {
+                    if let override { return override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : override }
+                    return try SQLStatementSelection.statement(in: document, selection: selectedRange)
+                }
+                let statement = try await withTaskCancellationHandler {
+                    try await parsing.value
+                } onCancel: { parsing.cancel() }
+                try Task.checkCancellation()
+                guard generation == token, !isClosed, !isClosing else { return }
+                guard let statement else {
+                    status = "No SQL statement"
+                    message = "Place the cursor in a statement or highlight SQL to run."
+                    return
+                }
+                resultIncomplete = true
+                status = "Executing…"; message = "Waiting for PostgreSQL…"; rowCount = 0; columns = []; elapsed = 0
+                selectedValue = nil; selectedColumn = nil; revision += 1
+                let oldStore = store
+                let resultStore = Self.makeStore(allowsSpooling: allowsSpooling)
+                executingStore = resultStore; store = resultStore
+                let relay = ProgressRelay()
+                events.info("Query submitted")
+                let interval = signposter.beginInterval("ExecuteAndStore")
+                defer { signposter.endInterval("ExecuteAndStore", interval) }
                 await oldStore.close()
                 try await resultStore.reset()
                 try Task.checkCancellation()
@@ -112,7 +213,9 @@ final class Worksheet: Identifiable {
                     }
                 }
                 guard generation == token else { return }
-                rowCount = await resultStore.rowCount()
+                let count = await resultStore.rowCount()
+                guard generation == token, !isClosing, !isClosed else { return }
+                rowCount = count
                 transaction = summary.transaction; elapsed = summary.elapsed
                 status = "Complete"; resultIncomplete = false
                 let countDescription = columns.isEmpty ? "\(summary.rowCount.formatted()) rows affected" : "\(rowCount.formatted()) rows"
@@ -120,14 +223,16 @@ final class Worksheet: Identifiable {
                 events.info("Query completed; rows: \(self.rowCount)")
             } catch {
                 guard generation == token else { return }
-                // Consumer failures (including disk quota) must also stop PostgreSQL.
-                await source.cancel()
-                rowCount = await resultStore.rowCount()
-                transaction = await source.transactionState()
+                if let executingStore {
+                    // Consumer failures (including disk quota) must also stop PostgreSQL.
+                    await source.cancel()
+                    let count = await executingStore.rowCount()
+                    let state = await source.transactionState()
+                    guard generation == token, !isClosing, !isClosed else { return }
+                    rowCount = count; transaction = state
+                }
                 show(error)
             }
-            guard generation == token else { return }
-            isBusy = false; isCancelling = false; operation = nil
         }
     }
 
@@ -144,14 +249,20 @@ final class Worksheet: Identifiable {
         operation?.cancel()
     }
     func disconnect() {
-        guard !isClosed, !isBusy, transaction == .idle else { return }
+        guard canIssueCommands, !isBusy, transaction == .idle else { return }
+        invalidateConnectionIntent()
         isBusy = true
-        Task { await session.disconnect(); isConnected = false; transaction = .unknown; status = "Disconnected"; isBusy = false }
+        let token = UUID(); generation = token
+        operation = Task {
+            await session.disconnect()
+            guard generation == token, !isClosed else { return }
+            isConnected = false; transaction = .unknown; status = "Disconnected"; isBusy = false; operation = nil
+        }
     }
     func exportCSV(to url: URL) {
-        guard !isClosed, !isBusy, !columns.isEmpty else { return }
+        guard canIssueCommands, !isBusy, !columns.isEmpty else { return }
         isBusy = true; isCancelling = false; status = "Exporting…"; error = nil
-        let resultStore = store; let resultColumns = columns; let token = generation
+        let resultStore = store; let resultColumns = columns; let token = UUID(); generation = token
         operation = Task {
             defer { if generation == token { isBusy = false; isCancelling = false; operation = nil } }
             do {
@@ -162,15 +273,26 @@ final class Worksheet: Identifiable {
         }
     }
     func prepareToClose() {
-        isClosed = true; isBusy = false; isConnected = false
-        generation = UUID()
+        guard !isClosing, !isClosed else { return }
+        isClosing = true; isLoading = false; status = "Closing…"
+        generation = UUID(); connectionIntent = UUID(); loadGeneration = UUID()
         operation?.cancel()
     }
     func close() async {
+        if let closeTask { await closeTask.value; return }
+        guard !isClosed else { return }
         prepareToClose()
-        await session.disconnect()
-        await store.close()
-        operation = nil
+        let source = session; let resultStore = store
+        let task = Task {
+            // The PostgreSQL driver closes its owned socket on its utility queue;
+            // it does not wait for a server response or transaction rollback.
+            await source.disconnect()
+            await resultStore.close()
+            operation = nil; closeTask = nil
+            isBusy = false; isConnected = false; isClosed = true; isClosing = false; isClosePending = false
+        }
+        closeTask = task
+        await task.value
     }
     private func show(_ failure: Error) {
         let dbError = failure as? DatabaseError

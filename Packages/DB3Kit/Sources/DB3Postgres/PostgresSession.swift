@@ -24,11 +24,17 @@ public final class PostgresSession: DatabaseSession, Sendable {
     }
 
     public func execute(sql: String, onEvent: @escaping @Sendable (QueryEvent) async throws -> Void) async throws -> QuerySummary {
+        try await execute(sql: sql, parameters: [], onEvent: onEvent)
+    }
+
+    /// Text parameters remain separate from SQL. nil represents SQL NULL.
+    /// The extended protocol still accepts exactly one statement per call.
+    public func execute(sql: String, parameters: [String?], onEvent: @escaping @Sendable (QueryEvent) async throws -> Void) async throws -> QuerySummary {
         let id = UUID()
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
-                owner.enqueueQuery(id: id, sql: sql, consumer: onEvent, continuation: continuation)
+                owner.enqueueQuery(id: id, sql: sql, parameters: parameters, consumer: onEvent, continuation: continuation)
             }
         } onCancel: { owner.cancelOperation(id) }
     }
@@ -109,8 +115,8 @@ private final class ConnectionOwner: @unchecked Sendable {
         queue.async { self.beginConnect(id: id, profile: profile, password: password, continuation: continuation) }
     }
 
-    func enqueueQuery(id: UUID, sql: String, consumer: @escaping @Sendable (QueryEvent) async throws -> Void, continuation: CheckedContinuation<QuerySummary, any Error>) {
-        queue.async { self.beginQuery(id: id, sql: sql, consumer: consumer, continuation: continuation) }
+    func enqueueQuery(id: UUID, sql: String, parameters: [String?], consumer: @escaping @Sendable (QueryEvent) async throws -> Void, continuation: CheckedContinuation<QuerySummary, any Error>) {
+        queue.async { self.beginQuery(id: id, sql: sql, parameters: parameters, consumer: consumer, continuation: continuation) }
     }
 
     func cancelOperation(_ id: UUID) {
@@ -213,6 +219,10 @@ private final class ConnectionOwner: @unchecked Sendable {
             }
         }
         guard let connection else { close(error: DatabaseError("libpq could not allocate a connection.", connectionLost: true)); return }
+        // libpq has no public startup-error SQLSTATE accessor. Its documented
+        // verbose format preserves that field while authenticating; restore
+        // normal query diagnostics as soon as startup succeeds.
+        PQsetErrorVerbosity(connection, PQERRORS_VERBOSE)
         PQsetNoticeReceiver(connection, { context, result in
             guard let context, let result else { return }
             Unmanaged<ConnectionOwner>.fromOpaque(context).takeUnretainedValue().receiveNotice(result)
@@ -229,6 +239,7 @@ private final class ConnectionOwner: @unchecked Sendable {
         case PGRES_POLLING_READING: watchSocket(read: true)
         case PGRES_POLLING_WRITING: watchSocket(read: false)
         case PGRES_POLLING_OK:
+            PQsetErrorVerbosity(connection, PQERRORS_DEFAULT)
             guard PQsetnonblocking(connection, 1) == 0 else { close(error: connectionError()); return }
             guard isUTF8 else { close(error: DatabaseError("PostgreSQL did not accept UTF-8 client encoding.", connectionLost: true)); return }
             deadline?.cancel(); deadline = nil
@@ -241,7 +252,7 @@ private final class ConnectionOwner: @unchecked Sendable {
         }
     }
 
-    private func beginQuery(id: UUID, sql: String, consumer: @escaping @Sendable (QueryEvent) async throws -> Void, continuation: CheckedContinuation<QuerySummary, any Error>) {
+    private func beginQuery(id: UUID, sql: String, parameters: [String?], consumer: @escaping @Sendable (QueryEvent) async throws -> Void, continuation: CheckedContinuation<QuerySummary, any Error>) {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !wasCancelled(id) else { continuation.resume(throwing: CancellationError()); return }
         guard connecting == nil, query == nil else {
@@ -254,10 +265,19 @@ private final class ConnectionOwner: @unchecked Sendable {
         guard !sql.utf8.contains(0) else {
             continuation.resume(throwing: DatabaseError("SQL cannot contain a NUL character.")); return
         }
+        guard parameters.count <= 65_535, !parameters.contains(where: { $0?.utf8.contains(0) == true }) else {
+            continuation.resume(throwing: DatabaseError("SQL parameters contain a NUL character or exceed the PostgreSQL parameter limit.")); return
+        }
         query = Query(id: id, consumer: consumer, continuation: continuation)
         notices.removeAll(keepingCapacity: true); noticeBytes = 0
-        // Extended protocol with zero parameters deliberately rejects scripts.
-        let sent = sql.withCString { PQsendQueryParams(connection, $0, 0, nil, nil, nil, nil, 0) }
+        // libpq copies parameter bytes before returning; none of these pointers
+        // escape this private owner queue or remain live across a suspension.
+        let values = parameters.map { $0.map { strdup($0) } ?? nil }
+        defer { values.forEach { free($0) } }
+        let pointers: [UnsafePointer<CChar>?] = values.map { $0.map { UnsafePointer<CChar>($0) } }
+        let sent = pointers.withUnsafeBufferPointer { buffer in
+            sql.withCString { PQsendQueryParams(connection, $0, Int32(parameters.count), nil, buffer.baseAddress, nil, nil, 0) }
+        }
         guard sent == 1 else { close(error: connectionError()); return }
         guard PQsetSingleRowMode(connection) == 1 else {
             close(error: DatabaseError("libpq could not enable incremental result delivery.", connectionLost: true)); return
@@ -580,8 +600,21 @@ private final class ConnectionOwner: @unchecked Sendable {
     }
 
     private func connectionError() -> DatabaseError {
-        let message = connection.flatMap { PQerrorMessage($0) }.map { String(cString: $0) } ?? "PostgreSQL connection failed."
-        return DatabaseError(message.trimmingCharacters(in: .whitespacesAndNewlines), connectionLost: true)
+        var message = connection.flatMap { PQerrorMessage($0) }.map { String(cString: $0) } ?? "PostgreSQL connection failed."
+        var state: String?
+        if connecting != nil, let connection {
+            if PQconnectionNeedsPassword(connection) == 1 { state = "28000" }
+            // The five-character server code is independent of the server's
+            // message language. Do not infer auth failure just because a
+            // password was used: database/TLS/config failures are distinct.
+            if let field = message.range(of: #":[\t ]+(?=[0-9A-Z]*[0-9])[0-9A-Z]{5}: "#, options: .regularExpression) {
+                let token = message[field].trimmingCharacters(in: CharacterSet(charactersIn: ": \t\n"))
+                state = token
+                message.replaceSubrange(field, with: ": ")
+            }
+            message = message.components(separatedBy: "\n").filter { !$0.hasPrefix("LOCATION:") }.joined(separator: "\n")
+        }
+        return DatabaseError(message.trimmingCharacters(in: .whitespacesAndNewlines), sqlState: state, connectionLost: true)
     }
 
     private func cancellationError() -> DatabaseError {

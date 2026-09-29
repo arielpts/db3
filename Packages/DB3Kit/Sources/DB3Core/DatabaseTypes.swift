@@ -18,8 +18,33 @@ public struct ConnectionProfile: Codable, Hashable, Identifiable, Sendable {
     public var username: String
     public var tls: TLSMode
     public var rootCertificate: String
-    public init(id: UUID = UUID(), name: String = "Local PostgreSQL", host: String = "localhost", port: Int = 5432, database: String = "postgres", username: String = NSUserName(), tls: TLSMode = .verifyFull, rootCertificate: String = "") {
+    /// Initial Objects browser filter, using the exact schema name rather than a SQL-quoted identifier.
+    /// This does not change a SQL session's search_path.
+    public var defaultSchema: String = "public"
+    public init(id: UUID = UUID(), name: String = "Local PostgreSQL", host: String = "localhost", port: Int = 5432, database: String = "postgres", username: String = NSUserName(), tls: TLSMode = .verifyFull, rootCertificate: String = "", defaultSchema: String = "public") {
         self.id = id; self.name = name; self.host = host; self.port = port; self.database = database; self.username = username; self.tls = tls; self.rootCertificate = rootCertificate
+        self.defaultSchema = defaultSchema
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, host, port, database, username, tls, rootCertificate, defaultSchema
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        host = try values.decode(String.self, forKey: .host)
+        port = try values.decode(Int.self, forKey: .port)
+        database = try values.decode(String.self, forKey: .database)
+        username = try values.decode(String.self, forKey: .username)
+        tls = try values.decode(TLSMode.self, forKey: .tls)
+        rootCertificate = try values.decode(String.self, forKey: .rootCertificate)
+        if values.contains(.defaultSchema) {
+            defaultSchema = try values.decode(String.self, forKey: .defaultSchema)
+        } else {
+            defaultSchema = "public"
+        }
     }
 }
 

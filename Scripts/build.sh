@@ -1,6 +1,9 @@
 #!/bin/zsh
 set -euo pipefail
 cd "${0:A:h:h}"
+if [[ "${1:-}" != "--locked" ]]; then
+  exec python3 Scripts/with-build-lock.py /bin/zsh "${0:A}" --locked
+fi
 if [[ ! -f Vendor/PostgreSQL/lib/libpq.5.dylib ]]; then
   python3 Scripts/prepare-postgres.py
 fi

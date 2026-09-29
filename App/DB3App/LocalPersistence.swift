@@ -3,7 +3,7 @@ import Security
 import DB3Core
 
 /// All blocking persistence and credential operations are confined to this queue.
-final class LocalPersistence: Sendable {
+final class LocalPersistence: WorkbenchPersistence {
     private let queue = DispatchQueue(label: "app.db3.persistence", qos: .utility)
     private func perform<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
@@ -61,4 +61,19 @@ final class LocalPersistence: Sendable {
     }
     func readSQL(at url: URL) async throws -> String { try await perform { try String(contentsOf: url, encoding: .utf8) } }
     func writeSQL(_ sql: String, at url: URL) async throws { try await perform { try sql.write(to: url, atomically: true, encoding: .utf8) } }
+}
+
+/// File identity can touch the filesystem (including network volumes). Keep it
+/// off MainActor and off Swift's cooperative executor, with bounded concurrency.
+final class SQLFileIdentityResolver: Sendable {
+    static let shared = SQLFileIdentityResolver()
+    private let queue = DispatchQueue(label: "app.db3.file-identity", qos: .utility)
+
+    func resolve(_ url: URL) async -> URL {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: url.standardizedFileURL.resolvingSymlinksInPath())
+            }
+        }
+    }
 }

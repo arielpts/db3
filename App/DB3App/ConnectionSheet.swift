@@ -9,6 +9,8 @@ struct ConnectionSheet: View {
     }
 
     let model: WorkbenchModel
+    @State private var target: ConnectionEditTarget?
+    private let catalogIntent: UUID?
     @Environment(\.dismiss) private var dismiss
     @State private var profile: ConnectionProfile
     @State private var inputMethod: InputMethod
@@ -28,6 +30,8 @@ struct ConnectionSheet: View {
 
     init(model: WorkbenchModel, profile: ConnectionProfile?) {
         self.model = model
+        catalogIntent = model.catalogConnectionEditIntent
+        _target = State(initialValue: model.connectionEditTarget)
         _profile = State(initialValue: profile ?? ConnectionProfile())
         _inputMethod = State(initialValue: profile == nil ? .url : .manual)
     }
@@ -37,7 +41,7 @@ struct ConnectionSheet: View {
                 Image(systemName: "externaldrive.connected.to.line.below").font(.system(size: 28)).foregroundStyle(.teal)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("PostgreSQL connection").font(.title2.bold())
-                    Text("A dedicated session for your worksheet.").foregroundStyle(.secondary)
+                    Text(catalogIntent == nil ? "A dedicated session for your worksheet." : "Connection settings for the objects browser.").foregroundStyle(.secondary)
                 }
                 Spacer()
             }.padding(24)
@@ -63,6 +67,12 @@ struct ConnectionSheet: View {
                     }
                     Toggle("Save password in Keychain", isOn: $remember)
                 }
+                Section("Objects browser") {
+                    TextField("Default schema", text: $profile.defaultSchema, prompt: Text("public"))
+                        .autocorrectionDisabled()
+                    Text("Enter the exact schema name, without SQL identifier quotes. Leave empty for public. This sets the Objects filter; it does not change the SQL search path.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if inputMethod == .manual {
                     Section("Transport security") {
                         Picker("TLS", selection: $profile.tls) { ForEach(TLSMode.allCases, id: \.self) { Text($0.title).tag($0) } }
@@ -79,13 +89,21 @@ struct ConnectionSheet: View {
             HStack {
                 if saving || loadingCredentials { ProgressView().controlSize(.small) }
                 Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction).disabled(saving)
-                Button("Save & Connect") {
+                Button("Cancel") { model.dismissConnectionEditor(); dismiss() }.keyboardShortcut(.cancelAction).disabled(saving)
+                Button(catalogIntent == nil ? "Save & Connect" : "Save & Load Objects") {
                     guard let connection = resolvedConnection else { return }
                     let savePassword = remember
                     saving = true; failure = nil
                     Task {
-                        do { try await model.saveAndConnect(profile: connection.profile, password: connection.password, remember: savePassword); dismiss() }
+                        do {
+                            if let catalogIntent {
+                                try await model.saveCatalogConnection(profile: connection.profile, password: connection.password, remember: savePassword, intent: catalogIntent)
+                            } else {
+                                try await model.saveAndConnect(profile: connection.profile, password: connection.password, remember: savePassword, target: target)
+                            }
+                            model.dismissConnectionEditor()
+                            dismiss()
+                        }
                         catch { failure = error.localizedDescription; saving = false }
                     }
                 }.keyboardShortcut(.defaultAction).disabled(saving || loadingCredentials || resolvedConnection == nil)
@@ -93,12 +111,22 @@ struct ConnectionSheet: View {
         }
         .frame(width: 560, height: 680)
         .task {
-            guard model.profiles.contains(where: { $0.id == profile.id }) else { return }
+            guard editorIsCurrent, model.profiles.contains(where: { $0.id == profile.id }) else { return }
             loadingCredentials = true
             defer { loadingCredentials = false }
-            do { password = try await model.persistence.password(for: profile.id) }
+            do {
+                let value = try await model.persistence.password(for: profile.id)
+                guard editorIsCurrent else { return }
+                password = value
+            }
             catch { failure = error.localizedDescription }
         }
+    }
+
+    private var editorIsCurrent: Bool {
+        if let catalogIntent { return model.catalogConnectionEditIntent == catalogIntent }
+        guard let target else { return false }
+        return model.worksheet(id: target.worksheetID)?.acceptsConnectionIntent(target.intent) == true
     }
 
     private var currentParsedURL: ParsedPostgresConnectionURL? {
@@ -111,12 +139,17 @@ struct ConnectionSheet: View {
             var connection = parsed.profile
             connection.id = profile.id
             connection.name = profile.name
+            connection.defaultSchema = resolvedDefaultSchema
             return (connection, parsed.password ?? urlPassword)
         }
         guard !profile.host.isEmpty, !profile.database.isEmpty, !profile.username.isEmpty,
               (1...65535).contains(profile.port) else { return nil }
-        return (profile, password)
+        var connection = profile
+        connection.defaultSchema = resolvedDefaultSchema
+        return (connection, password)
     }
+
+    private var resolvedDefaultSchema: String { profile.defaultSchema.isEmpty ? "public" : profile.defaultSchema }
 
     @ViewBuilder
     private var urlFields: some View {

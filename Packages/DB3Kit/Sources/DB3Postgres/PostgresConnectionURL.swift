@@ -83,8 +83,8 @@ public enum PostgresConnectionURL {
             tls = .verifyFull
         }
 
-        // Only identity and the user-assigned label carry over from an existing
-        // profile. Omitted URL fields must not inherit another server's settings.
+        // Identity, label, and the Objects browser preference carry over from an
+        // existing profile. Omitted URL fields must not inherit server settings.
         let username = nonempty(values["user"]) ?? NSUserName()
         let parsedProfile = ConnectionProfile(
             id: profile.id,
@@ -94,7 +94,8 @@ public enum PostgresConnectionURL {
             database: nonempty(values["dbname"]) ?? username,
             username: username,
             tls: tls,
-            rootCertificate: values["sslrootcert"] ?? ""
+            rootCertificate: values["sslrootcert"] ?? "",
+            defaultSchema: profile.defaultSchema
         )
 
         // libpq omits the password option for `user:@host`. Preserve the user's

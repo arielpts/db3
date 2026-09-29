@@ -9,7 +9,8 @@ final class PostgresConnectionURLTests: XCTestCase {
             for password in ["", "p@ss:/%#?&+= ça🐘"] {
                 let profile = ConnectionProfile(name: "Round trip", host: host, port: 6543,
                                                 database: "db/%#?&+=ação🐘", username: "user@team:%/#?&+=ça🐘",
-                                                tls: .require, rootCertificate: "/tmp/root #?&+%🐘.pem")
+                                                tls: .require, rootCertificate: "/tmp/root #?&+%🐘.pem",
+                                                defaultSchema: " App Data ")
                 let url = PostgresConnectionURL.string(from: profile, password: password)
                 let parsed = try PostgresConnectionURL.parse(url, applyingTo: profile)
                 XCTAssertEqual(parsed.profile, profile)
@@ -36,10 +37,11 @@ final class PostgresConnectionURLTests: XCTestCase {
     func testOmittedFieldsUseDefaultsWithoutInheritingProfileSettings() throws {
         let original = ConnectionProfile(name: "Saved label", host: "old.example.com", port: 9000,
                                          database: "old_database", username: "old_user", tls: .disable,
-                                         rootCertificate: "/old/root.pem")
+                                         rootCertificate: "/old/root.pem", defaultSchema: "reporting")
         let parsed = try PostgresConnectionURL.parse("postgresql://", applyingTo: original)
         XCTAssertEqual(parsed.profile.id, original.id)
         XCTAssertEqual(parsed.profile.name, original.name)
+        XCTAssertEqual(parsed.profile.defaultSchema, "reporting")
         XCTAssertEqual(parsed.profile.host, "localhost")
         XCTAssertEqual(parsed.profile.port, 5432)
         XCTAssertEqual(parsed.profile.username, NSUserName())
@@ -48,6 +50,20 @@ final class PostgresConnectionURLTests: XCTestCase {
         XCTAssertEqual(parsed.profile.rootCertificate, "")
         XCTAssertNil(parsed.password)
         XCTAssertEqual(try PostgresConnectionURL.parse("postgres://alice@localhost").profile.database, "alice")
+    }
+
+    func testSchemaPreferenceIsSeparateFromTheConnectionURL() throws {
+        let schema = "browser only schema"
+        let original = ConnectionProfile(defaultSchema: schema)
+        let url = PostgresConnectionURL.string(from: original, password: "")
+        XCTAssertFalse(url.contains("schema"))
+        XCTAssertFalse(url.contains("search_path"))
+        XCTAssertEqual(try PostgresConnectionURL.parse(url).profile.defaultSchema, "public")
+        XCTAssertEqual(try PostgresConnectionURL.parse(url, applyingTo: original).profile.defaultSchema, schema)
+
+        let changedURL = try PostgresConnectionURL.parse("postgresql://reader@other.invalid/other_db", applyingTo: original)
+        XCTAssertEqual(changedURL.profile.defaultSchema, schema)
+        XCTAssertEqual(changedURL.profile.host, "other.invalid")
     }
 
     func testEmptyDefaultableParametersDoNotInheritPreviousValues() throws {

@@ -173,13 +173,13 @@ public actor ResultStore {
     /// atomically replaced only after success; errors/cancellation keep it intact.
     /// Append/reset are rejected during export, and close cancels an active export.
     @discardableResult
-    public func exportCSV(columns: [DatabaseColumn], to destination: URL) async throws -> Int {
+    public func exportCSV(columns: [DatabaseColumn], to destination: URL, trailingMetadataColumns: Int = 0) async throws -> Int {
         guard !appendPending, exportCancellation == nil else { throw ResultStoreError.busy }
         let cancellation = CancellationFlag()
         exportCancellation = cancellation
         defer { exportCancellation = nil }
         return try await perform(cancellation: cancellation) { storage, cancellation in
-            try storage.exportCSV(columns: columns, to: destination, cancellation: cancellation)
+            try storage.exportCSV(columns: columns, to: destination, trailingMetadataColumns: trailingMetadataColumns, cancellation: cancellation)
         }
     }
 
@@ -416,7 +416,8 @@ private final class Storage: @unchecked Sendable {
         } catch { throw Self.storageError(error) }
     }
 
-    func exportCSV(columns: [DatabaseColumn], to destination: URL, cancellation: CancellationFlag) throws -> Int {
+    func exportCSV(columns: [DatabaseColumn], to destination: URL, trailingMetadataColumns: Int, cancellation: CancellationFlag) throws -> Int {
+        guard (0...1).contains(trailingMetadataColumns) else { throw ResultStoreError.columnCount(expected: columns.count, actual: trailingMetadataColumns) }
         guard destination.isFileURL, !destination.path.utf8.contains(0) else {
             throw ResultStoreError.io("Choose a local file for CSV export.")
         }
@@ -443,10 +444,10 @@ private final class Storage: @unchecked Sendable {
                 let rows = try loadPage(at: index, cacheResult: false)
                 for row in rows {
                     try cancellation.check()
-                    guard row.count == columns.count else {
+                    guard row.count == columns.count + trailingMetadataColumns else {
                         throw ResultStoreError.columnCount(expected: columns.count, actual: row.count)
                     }
-                    for (index, value) in row.enumerated() {
+                    for (index, value) in row.prefix(columns.count).enumerated() {
                         if index > 0 { try writer.append(0x2C) }
                         if case .text(let text) = value { try writer.quoted(text) }
                     }

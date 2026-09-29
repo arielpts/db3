@@ -83,8 +83,8 @@ final class WorkspaceRecoveryLifecycleTests: XCTestCase {
             XCTAssertTrue(accepted)
             let snapshot = await recovery.snapshot
             XCTAssertEqual(snapshot?.tabs.first?.sql, "UPDATE example SET value = 1;")
-            let queries = await fixture.sessions[0].queries
-            XCTAssertFalse(queries.contains("COMMIT"))
+            let commands = await fixture.sessions[0].commands
+            XCTAssertFalse(commands.contains("COMMIT"))
         }
     }
 

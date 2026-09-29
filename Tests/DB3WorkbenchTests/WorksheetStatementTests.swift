@@ -42,8 +42,8 @@ final class WorksheetStatementTests: XCTestCase {
         sheet.selection = NSRange(location: NSNotFound, length: 0)
         sheet.run(sql: "BEGIN")
         try await eventually { !sheet.isBusy }
-        let queries = await fixture.sessions[0].queries
-        XCTAssertEqual(queries, ["BEGIN"])
+        let commands = await fixture.sessions[0].commands
+        XCTAssertEqual(commands, ["BEGIN"])
         XCTAssertNil(sheet.error)
         await fixture.model.shutdown()
     }

@@ -86,6 +86,37 @@ final class CatalogPostgresTests: XCTestCase {
         await setup.disconnect()
     }
 
+    func testNamespaceMembershipIsAppliedBeforePaginationAndRecreationDoesNotReuseOverrides() async throws {
+        try await withFixture { session, source, password, schema in
+            try await run("CREATE TABLE \(schema).aaa_unclassified (id integer)", on: session)
+            try await run("CREATE TABLE \(schema).zzz_target (id integer)", on: session)
+            let service = PostgresCatalogService()
+            let membership = CatalogMembership(schema: schema, relation: "zzz_target")
+            let filter = CatalogNamespaceFilter(included: [membership])
+            let page = try await service.page(source: source, password: password, query: CatalogQuery(schema: schema, limit: 1, namespaceFilter: filter))
+            XCTAssertEqual(page.objects.map(\.name), ["zzz_target"])
+            XCTAssertNil(page.nextCursor)
+            let target = try XCTUnwrap(page.objects.first)
+            XCTAssertFalse(target.identityToken.isEmpty)
+            let identity = CatalogMembership(schema: schema, relation: "zzz_target", oid: target.id.relationOID, token: target.identityToken)
+            let unclassified = try await service.page(source: source, password: password,
+                query: CatalogQuery(schema: schema, namespaceFilter: .init(excluded: [identity])))
+            XCTAssertEqual(unclassified.objects.map(\.name), ["aaa_unclassified"])
+            try await run("DROP TABLE \(schema).zzz_target", on: session)
+            try await run("CREATE TABLE \(schema).zzz_target (id integer)", on: session)
+            let stale = try await service.page(source: source, password: password,
+                query: CatalogQuery(schema: schema, namespaceFilter: .init(included: [identity])))
+            XCTAssertTrue(stale.objects.isEmpty)
+            let replacement = try await service.page(source: source, password: password,
+                query: CatalogQuery(search: "zzz", schema: schema, namespaceFilter: .init(excluded: [identity])))
+            XCTAssertEqual(replacement.objects.map(\.name), ["zzz_target"])
+            let noMembership = try await service.page(source: source, password: password,
+                query: CatalogQuery(schema: schema, namespaceFilter: .init(included: [])))
+            XCTAssertTrue(noMembership.objects.isEmpty)
+            await service.disconnect()
+        }
+    }
+
     func testBoundParametersPreserveNullUnicodeAndSQLSyntaxAsValues() async throws {
         try await withFixture { session, _, _, _ in
             let special = "x'); SELECT pg_sleep(30); -- %_\\ 🐘"

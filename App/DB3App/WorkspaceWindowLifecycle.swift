@@ -89,6 +89,13 @@ struct WorkbenchCommands: Commands {
             Button("New Query") { model?.addWorksheet() }.keyboardShortcut("n").disabled(!commandsAllowed || model?.canAddWorksheet != true)
             Button("New Connection…") { model?.newConnection() }.keyboardShortcut("n", modifiers: [.command, .shift]).disabled(!commandsAllowed)
             Divider()
+            Button("Open Project Folder…") { model?.project.chooseFolder() }.keyboardShortcut("o", modifiers: [.command, .shift]).disabled(!commandsAllowed)
+            Menu("Recent Projects") {
+                ForEach(model?.project.recents ?? []) { recent in Button(recent.name) { model?.project.openRecent(recent) } }
+            }.disabled(!commandsAllowed)
+            Button("Project Details…") { model?.project.showingDetails = true }.disabled(!commandsAllowed)
+            Button("Close Project") { model?.project.close() }.disabled(!commandsAllowed || model?.project.isOpen != true)
+            Divider()
             Button("Open SQL…") { model?.openSQL() }.keyboardShortcut("o").disabled(!commandsAllowed)
         }
         CommandGroup(replacing: .saveItem) {

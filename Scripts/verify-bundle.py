@@ -16,6 +16,10 @@ for path in [binary, *libraries]:
         assert dependency.startswith(("@rpath/", "@loader_path/", "@executable_path/", "/System/", "/usr/lib/")), f"Nonportable dependency: {dependency}"
     commands = subprocess.check_output(["otool", "-l", str(path)], text=True)
     assert "Vendor/PostgreSQL" not in commands, f"Build-machine rpath remains in {path.name}"
+# Embedded source parsing must ship its pinned provenance and license notices.
+project_resources = app / "Contents/Resources/DB3Kit_DB3Projects.bundle/Contents/Resources"
+for name in ["TreeSitterPins.json", "Licenses/tree-sitter-LICENSE.txt", "Licenses/tree-sitter-python-LICENSE.txt"]:
+    assert (project_resources / name).is_file(), f"Missing project parser resource: {name}"
 subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
 signature = subprocess.run(["codesign", "-dvv", str(app)], check=True, text=True, capture_output=True).stderr
 assert not ("Signature=adhoc" in signature and "runtime" in signature), "Ad-hoc app plus hardened library validation cannot load the ad-hoc PostgreSQL libraries; use local build settings or sign all code with one Developer ID."

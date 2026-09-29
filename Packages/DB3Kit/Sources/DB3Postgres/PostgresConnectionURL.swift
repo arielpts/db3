@@ -95,7 +95,8 @@ public enum PostgresConnectionURL {
             username: username,
             tls: tls,
             rootCertificate: values["sslrootcert"] ?? "",
-            defaultSchema: profile.defaultSchema
+            defaultSchema: profile.defaultSchema,
+            environment: profile.environment
         )
 
         // libpq omits the password option for `user:@host`. Preserve the user's

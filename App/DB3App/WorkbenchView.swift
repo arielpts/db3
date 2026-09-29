@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import DB3Core
 
@@ -27,6 +28,8 @@ struct WorkbenchView: View {
         .navigationSplitViewStyle(.balanced)
         .tint(.teal)
         .navigationTitle("db3")
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.project.refresh() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in model.project.refresh(force: true) }
         .disabled(model.isRestoringWorkspace || model.isPreservingWorkspace)
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
@@ -53,6 +56,10 @@ struct WorkbenchView: View {
         .sheet(item: Binding(get: { presentedConnection }, set: { _ in })) { presentation in
             Group {
                 switch presentation {
+                case .project:
+                    if let sourceModel = model.project.inspectedModel {
+                        ProjectSourceModelView(project: model.project, model: sourceModel)
+                    } else { ProjectDetailsSheet(model: model, project: model.project) }
                 case .editor:
                     ConnectionSheet(model: model, profile: model.editingProfile)
                 case .worksheet(let request):
@@ -75,16 +82,19 @@ struct WorkbenchView: View {
         }
         if let request = model.worksheetCredentialRequest { pending.append(.worksheet(request)) }
         if let request = model.objectBrowser.credentialRequest { pending.append(.catalog(request)) }
+        if model.project.showingDetails { pending.append(.project) }
         return pending
     }
 
     private enum ConnectionPresentation: Identifiable {
+        case project
         case editor(UUID)
         case worksheet(WorksheetCredentialRequest)
         case catalog(ObjectBrowserCredentialRequest)
 
         var id: UUID {
             switch self {
+            case .project: UUID(uuidString: "3A43C70C-06D9-43CA-A510-7F1AC0C07BD3")!
             case .editor(let id): id
             case .worksheet(let request): request.id
             case .catalog(let request): request.id
@@ -95,13 +105,15 @@ struct WorkbenchView: View {
     private var sidebar: some View {
         GeometryReader { geometry in
             VStack(spacing: 0) {
+                if model.project.isOpen { ProjectSidebarStatus(project: model.project); Divider() }
                 connections.frame(height: 26 + min(
-                    CGFloat(max(1, model.profiles.count)) * 44,
+                    CGFloat(max(1, model.visibleProfiles.count)) * 44,
                     max(44, min(176, geometry.size.height * 0.22))
                 ))
                 Divider()
-                ObjectBrowserView(browser: model.objectBrowser, canAddQuery: model.canAddWorksheet,
-                    openQuery: model.openSelectedObjectQuery, editConnection: model.editBrowserConnection)
+                ObjectBrowserView(browser: model.objectBrowser, project: model.project, canAddQuery: model.canAddWorksheet,
+                    openQuery: model.openSelectedObjectQuery, openEditing: model.openSelectedObjectForEditing,
+                    editConnection: model.editBrowserConnection)
                     .frame(maxHeight: .infinity)
                     .disabled(model.isCoordinatingClose)
             }
@@ -118,16 +130,19 @@ struct WorkbenchView: View {
                 .accessibilityAddTraits(.isHeader)
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    if model.profiles.isEmpty {
-                        Button(action: model.newConnection) {
-                            Label("Add PostgreSQL…", systemImage: "plus.circle")
+                    if model.visibleProfiles.isEmpty {
+                        Button {
+                            if model.project.isOpen { model.project.showingDetails = true }
+                            else { model.newConnection() }
+                        } label: {
+                            Label(model.project.isOpen ? "Project Connections…" : "Add PostgreSQL…", systemImage: "plus.circle")
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.horizontal, 12)
                                 .frame(height: 44)
                                 .contentShape(Rectangle())
                         }.buttonStyle(.plain).foregroundStyle(.secondary)
                     }
-                    ForEach(model.profiles) { profile in
+                    ForEach(model.visibleProfiles) { profile in
                         Button { model.selectBrowserProfile(profile) } label: {
                             HStack(spacing: 9) {
                                 Image(systemName: "externaldrive").foregroundStyle(.teal)

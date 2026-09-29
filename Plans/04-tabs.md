@@ -29,6 +29,8 @@ The inspector remains optional on the right. The tab bar belongs to the detail a
 
 Retain the current limit of **four open worksheets** for this task. Moving their navigation must not implicitly increase session or result-cache budgets. More disconnected documents than live connections can be a later change with its own admission and memory design.
 
+[11 — Project terminal](11-terminal.md) and [12 — Files explorer](12-files-explorer.md) extend this row with terminal/file tab kinds and separate resource budgets while retaining four database tabs. They replace worksheet-only command fallback with typed routing and create a fresh disconnected query only when all tab kinds are absent. [13 — Workspace layout](13-workspace-layout.md) distributes the same retained tabs across groups without duplicating their documents, connections, or processes; its position shortcuts are local to the active group. These are planned extensions, not current tab behavior.
+
 ## Current behavior and integration points
 
 | Location | Existing behavior | Planned change |

@@ -61,25 +61,138 @@ final class ObjectBrowserIntegrationTests: XCTestCase {
         XCTAssertEqual(opened.queryContext?.object, "Order.Items")
         XCTAssertEqual(original.sql, originalSQL)
         XCTAssertTrue(opened.isDirty)
-        XCTAssertFalse(opened.isConnected)
+        try await eventually { opened.isConnected && !opened.isBusy }
+        let openedConnections = await fixture.sessions[1].connections
+        XCTAssertEqual(openedConnections.map(\.profile), [profile])
+        let originalConnections = await fixture.sessions[0].connections
+        XCTAssertTrue(originalConnections.isEmpty)
         for session in fixture.sessions {
-            let connections = await session.connections
             let queries = await session.queries
-            XCTAssertTrue(connections.isEmpty)
             XCTAssertTrue(queries.isEmpty)
         }
         model.addWorksheet(); model.addWorksheet()
         let IDs = model.worksheets.map(\.id); let active = model.active
+        let passwordReadsBeforeCapacity = await fixture.persistence.passwordReads
         model.openSelectedObjectQuery()
+        model.openSelectedObjectForEditing()
         XCTAssertEqual(model.worksheets.map(\.id), IDs)
         XCTAssertTrue(model.active === active)
         XCTAssertEqual(model.error, model.tabLimitMessage)
+        let passwordReadsAfterCapacity = await fixture.persistence.passwordReads
+        XCTAssertEqual(passwordReadsAfterCapacity, passwordReadsBeforeCapacity)
+        for session in fixture.sessions.suffix(2) {
+            let connections = await session.connections
+            XCTAssertTrue(connections.isEmpty, "Rejected object actions must not connect the unrelated active tab.")
+        }
 
         model.profiles[0].host = "changed.invalid"
         XCTAssertEqual(opened.profile?.host, "original.invalid")
         XCTAssertFalse(model.objectBrowser.canUseObjects)
         model.openSelectedObjectQuery()
         XCTAssertEqual(model.worksheets.map(\.id), IDs)
+        await model.shutdown()
+    }
+
+    func testEditingObjectConnectsCapturedSourceAndLeavesExistingSessionUntouched() async throws {
+        let fixture = ObjectsWorkbenchFixture(); let model = fixture.model
+        let originalProfile = ConnectionProfile(name: "Existing", host: "existing.invalid", database: "existing_db")
+        let objectProfile = ConnectionProfile(name: "Object source", host: "objects.invalid", database: "object_db")
+        model.profiles = [originalProfile, objectProfile]
+        let original = model.active
+        original.sql = "SELECT 'existing query';"
+        original.connect(originalProfile, password: "existing-only")
+        try await eventually { original.isConnected && !original.isBusy }
+        let originalIntent = original.connectionIntent
+        let originalDisconnects = await fixture.sessions[0].disconnectCount
+        model.selectedBrowserProfileID = objectProfile.id
+        model.objectBrowser.load(password: "object-only")
+        try await eventually { model.objectBrowser.phase == .loaded }
+        let object = try XCTUnwrap(model.objectBrowser.objects.first)
+        model.objectBrowser.selectedObjectID = object.id
+
+        model.openSelectedObjectForEditing()
+        let opened = model.active
+        // Change browser context before the newly allocated session completes.
+        model.selectedBrowserProfileID = originalProfile.id
+        try await eventually { opened.isConnected && !opened.isBusy }
+        XCTAssertEqual(opened.profile, objectProfile)
+        XCTAssertEqual(opened.queryContext?.database, objectProfile.database)
+        XCTAssertEqual(opened.editTarget, WorksheetEditTarget(relationOID: object.id.relationOID, schema: object.schema, name: object.name))
+        XCTAssertEqual(opened.ownedEditSQL, opened.sql)
+        XCTAssertEqual(opened.sql, "SELECT *, xmin::text\nFROM ONLY \"Sales\"\"EU\".\"Order.Items\"\nLIMIT 1000;")
+        XCTAssertEqual(opened.commitMode, .manual)
+        let openedConnections = await fixture.sessions[1].connections
+        XCTAssertEqual(openedConnections, [.init(profile: objectProfile, password: "object-only")])
+        XCTAssertEqual(original.profile, originalProfile)
+        XCTAssertEqual(original.sql, "SELECT 'existing query';")
+        XCTAssertEqual(original.connectionIntent, originalIntent)
+        XCTAssertTrue(original.isConnected)
+        let remainingDisconnects = await fixture.sessions[0].disconnectCount
+        XCTAssertEqual(remainingDisconnects, originalDisconnects)
+        for session in fixture.sessions {
+            let commands = await session.commands
+            XCTAssertTrue(commands.isEmpty, "Opening an object connects its tab but does not run SQL.")
+        }
+        let passwordReads = await fixture.persistence.passwordReads
+        XCTAssertTrue(passwordReads.isEmpty)
+        await model.shutdown()
+    }
+
+    func testObjectQueryReusesOneShotAndEmptyBrowserPasswordsWithoutPersistence() async throws {
+        let fixture = ObjectsWorkbenchFixture(); let model = fixture.model
+        let profile = ConnectionProfile(name: "Session only", host: "session.invalid")
+        model.profiles = [profile]
+        model.selectedBrowserProfileID = profile.id
+        for (index, password) in ["one-shot-secret", ""].enumerated() {
+            model.objectBrowser.load(password: password)
+            try await eventually { model.objectBrowser.phase == .loaded }
+            let object = try XCTUnwrap(model.objectBrowser.objects.first)
+            model.objectBrowser.selectedObjectID = object.id
+            model.openSelectedObjectQuery()
+            let opened = model.active
+            try await eventually { opened.isConnected && !opened.isBusy }
+            let connections = await fixture.sessions[index + 1].connections
+            XCTAssertEqual(connections, [.init(profile: profile, password: password)])
+            let commands = await fixture.sessions[index + 1].commands
+            XCTAssertTrue(commands.isEmpty)
+        }
+        let reads = await fixture.persistence.passwordReads
+        let passwordWrites = await fixture.persistence.passwordWrites
+        let profileWrites = await fixture.persistence.profileWrites
+        XCTAssertTrue(reads.isEmpty, "The authenticated browser's memory-only password also handles trust authentication.")
+        XCTAssertTrue(passwordWrites.isEmpty)
+        XCTAssertTrue(profileWrites.isEmpty)
+        await model.shutdown()
+    }
+
+    func testStaleObjectSelectionCannotConnectOrExposeAnotherBrowserPassword() async throws {
+        let fixture = ObjectsWorkbenchFixture(); let model = fixture.model
+        let first = ConnectionProfile(name: "First", host: "first.invalid")
+        let second = ConnectionProfile(name: "Second", host: "second.invalid")
+        model.profiles = [first, second]
+        model.selectedBrowserProfileID = first.id
+        model.objectBrowser.load(password: "first-only")
+        try await eventually { model.objectBrowser.phase == .loaded }
+        model.objectBrowser.selectedObjectID = model.objectBrowser.objects.first?.id
+        let firstSelection = try XCTUnwrap(model.objectBrowser.captureSelection())
+        XCTAssertEqual(model.objectBrowser.password(for: firstSelection), "first-only")
+
+        model.objectBrowser.refresh()
+        XCTAssertNil(model.objectBrowser.password(for: firstSelection))
+        try await eventually { model.objectBrowser.phase == .loaded }
+        XCTAssertNil(model.objectBrowser.password(for: firstSelection), "A refreshed catalog generation invalidates old captures.")
+        model.selectedBrowserProfileID = second.id
+        model.objectBrowser.load(password: "second-only")
+        try await eventually { model.objectBrowser.phase == .loaded }
+        model.objectBrowser.selectedObjectID = firstSelection.object.id
+        let IDs = model.worksheets.map(\.id)
+        XCTAssertNil(model.objectBrowser.captureSelection())
+        XCTAssertNil(model.objectBrowser.password(for: firstSelection))
+        model.openSelectedObjectQuery()
+        model.openSelectedObjectForEditing()
+        XCTAssertEqual(model.worksheets.map(\.id), IDs)
+        let connections = await fixture.sessions[0].connections
+        XCTAssertTrue(connections.isEmpty)
         await model.shutdown()
     }
 

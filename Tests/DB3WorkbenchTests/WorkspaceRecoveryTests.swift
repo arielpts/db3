@@ -171,8 +171,9 @@ final class WorkspaceRecoveryTests: XCTestCase, @unchecked Sendable {
         let tabs = try XCTUnwrap(json["tabs"] as? [[String: Any]])
         XCTAssertEqual(Set(tabs[0].keys), ["title", "sql", "savedSQL", "selectionLocation", "selectionLength", "profile", "allowsSpooling", "resultTab", "isDemo"])
         let connection = try XCTUnwrap(tabs[0]["profile"] as? [String: Any])
-        XCTAssertEqual(Set(connection.keys), ["id", "name", "host", "port", "database", "username", "tls", "rootCertificate", "defaultSchema"])
+        XCTAssertEqual(Set(connection.keys), ["id", "name", "host", "port", "database", "username", "tls", "rootCertificate", "defaultSchema", "environment"])
         XCTAssertEqual(connection["defaultSchema"] as? String, "public")
+        XCTAssertEqual(connection["environment"] as? String, "unknown")
     }
 
     func testSymlinkRecoveryDocumentIsNotFollowed() async throws {

@@ -7,9 +7,12 @@ let vendor = root.appendingPathComponent("Vendor/PostgreSQL").path
 let package = Package(
     name: "DB3Kit",
     platforms: [.macOS("26.0")],
-    products: ["DB3Core", "DB3Postgres", "DB3Results", "DB3Editor", "DB3Grid"].map { .library(name: $0, targets: [$0]) } + [.executable(name: "db3-bench", targets: ["DB3Bench"])],
+    products: ["DB3Core", "DB3Postgres", "DB3Results", "DB3Editor", "DB3Grid", "DB3Projects"].map { .library(name: $0, targets: [$0]) } + [.executable(name: "db3-bench", targets: ["DB3Bench"])],
     targets: [
         .target(name: "DB3Core"),
+        .target(name: "CTreeSitter", exclude: ["LICENSE"], sources: ["src/lib.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("src")]),
+        .target(name: "CTreeSitterPython", exclude: ["LICENSE"], sources: ["src/parser.c", "src/scanner.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("src")]),
+        .target(name: "DB3Projects", dependencies: ["DB3Core", "DB3Postgres", "CTreeSitter", "CTreeSitterPython"], resources: [.copy("Licenses"), .copy("TreeSitterPins.json")]),
         .systemLibrary(name: "CLibPQ"),
         .target(name: "DB3Postgres", dependencies: ["DB3Core", "CLibPQ"], swiftSettings: [.unsafeFlags(["-Xcc", "-I" + vendor + "/include"])], linkerSettings: [.unsafeFlags(["-L" + vendor + "/lib", "-Xlinker", "-rpath", "-Xlinker", vendor + "/lib"])]),
         .target(name: "DB3Results", dependencies: ["DB3Core"]),
@@ -19,6 +22,7 @@ let package = Package(
         .testTarget(name: "DB3CoreTests", dependencies: ["DB3Core", "DB3Postgres", "DB3Results"]),
         .testTarget(name: "DB3GridTests", dependencies: ["DB3Grid"]),
         .testTarget(name: "DB3EditorTests", dependencies: ["DB3Editor"]),
+        .testTarget(name: "DB3ProjectsTests", dependencies: ["DB3Projects"]),
     ],
     swiftLanguageModes: [.v6]
 )

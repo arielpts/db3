@@ -6,8 +6,12 @@ import DB3Core
 /// through a value snapshot; neither row selection nor double-click executes it.
 struct ObjectBrowserView: View {
     @Bindable var browser: ObjectBrowserModel
+    var project: ProjectWorkspaceModel? = nil
+    @State private var namespaceTarget: DatabaseObject?
+    @State private var newNamespace = ""
     let canAddQuery: Bool
     let openQuery: () -> Void
+    var openEditing: (() -> Void)? = nil
     let editConnection: (ConnectionProfile) -> Void
     @FocusState private var searchFocused: Bool
 
@@ -75,6 +79,21 @@ struct ObjectBrowserView: View {
                 }
                 .labelsHidden().pickerStyle(.menu).controlSize(.small)
                 .disabled(browser.selectedProfile == nil)
+                if let project, project.binding(for: browser.selectedProfile ?? ConnectionProfile()) != nil {
+                    HStack(spacing: 6) {
+                        Picker("Namespace", selection: Binding(get: { project.selectedNamespace }, set: { project.selectedNamespace = $0 })) {
+                            Text("All Namespaces").tag(nil as String?)
+                            ForEach(project.namespaceNames, id: \.self) { Text(project.displayName($0)).tag(Optional($0)) }
+                            Text("Unclassified").tag(Optional("unclassified"))
+                        }.labelsHidden().controlSize(.small)
+                        Toggle("Base", isOn: Binding(get: { project.showBase }, set: { project.setShowBase($0) }))
+                            .toggleStyle(.checkbox).controlSize(.small).help("Show framework Base objects")
+                            .disabled(project.savingSettings)
+                    }
+                    if project.status == .partial || project.status == .unavailable {
+                        Text("Project coverage is incomplete; unmatched objects are Unclassified.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 if browser.schemasTruncated {
                     Text("Schema list limited. Set another schema in Connection Settings.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -89,20 +108,11 @@ struct ObjectBrowserView: View {
                 emptyState.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(selection: $browser.selectedObjectID) {
-                    ForEach(browser.objects) { object in
-                        ObjectBrowserRow(object: object)
-                            .tag(object.id)
-                            .contextMenu {
-                                Button("New SELECT Query", systemImage: "doc.badge.plus") {
-                                    browser.selectedObjectID = object.id
-                                    openQuery()
-                                }.disabled(!browser.canUseObjects || !canAddQuery)
-                                Button("Copy Qualified Name", systemImage: "doc.on.doc") {
-                                    copyName(object)
-                                }.disabled(!browser.canUseObjects)
-                            }
-                            .accessibilityAddTraits(browser.selectedObjectID == object.id ? .isSelected : [])
-                    }
+                    if let project, let profile = browser.selectedProfile, project.binding(for: profile) != nil {
+                        ForEach(project.groups(browser.objects)) { group in
+                            Section(group.title) { ForEach(group.objects) { object in objectRow(object) } }
+                        }
+                    } else { ForEach(browser.objects) { object in objectRow(object) } }
                 }
                 .listStyle(.sidebar)
                 .contentMargins(.vertical, 0, for: .scrollContent)
@@ -110,6 +120,54 @@ struct ObjectBrowserView: View {
                 .accessibilityLabel("Database objects")
             }
             footer
+        }
+        .alert("Assign Namespace", isPresented: Binding(get: { namespaceTarget != nil }, set: { if !$0 { namespaceTarget = nil } })) {
+            TextField("Namespace", text: $newNamespace)
+            Button("Cancel", role: .cancel) { namespaceTarget = nil }
+            Button("Save") {
+                if let object = namespaceTarget { Task { await project?.assign(object, namespace: newNamespace) } }
+                namespaceTarget = nil
+            }.disabled(newNamespace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } message: { Text("The assignment is saved in this project's .db3/project.json.") }
+    }
+
+    private func objectRow(_ object: DatabaseObject) -> some View {
+        ObjectBrowserRow(object: object, showsSchemaAndKind: browser.schema == nil,
+                         modelName: project?.sourceModel(for: object)?.name)
+            .tag(object.id)
+            .simultaneousGesture(TapGesture(count: 2).onEnded { openObject(object) })
+            .accessibilityAction(.default) { openObject(object) }
+            .contextMenu {
+                if let openEditing {
+                    Button("Edit Table Data", systemImage: "square.and.pencil") {
+                        browser.selectedObjectID = object.id; openEditing()
+                    }.disabled(!browser.canUseObjects || !canAddQuery || object.kind != .table || object.isPartition || object.isPartitioned)
+                }
+                Button("New SELECT Query", systemImage: "doc.badge.plus") {
+                    browser.selectedObjectID = object.id; openQuery()
+                }.disabled(!browser.canUseObjects || !canAddQuery)
+                Button("Copy Qualified Name", systemImage: "doc.on.doc") { copyName(object) }.disabled(!browser.canUseObjects)
+                if let project, project.binding(for: object.id.source.profile) != nil {
+                    if project.sourceModel(for: object) != nil { Button("Model Metadata…") { project.inspectModel(for: object) } }
+                    Menu("Assign Namespace") {
+                        ForEach(project.namespaceNames, id: \.self) { namespace in
+                            Button(project.displayName(namespace)) { Task { await project.assign(object, namespace: namespace) } }
+                        }
+                        Button("New Namespace…") { namespaceTarget = object; newNamespace = "" }
+                    }.disabled(!browser.canUseObjects || project.savingSettings)
+                }
+            }
+            .accessibilityAddTraits(browser.selectedObjectID == object.id ? .isSelected : [])
+    }
+
+    private func openObject(_ object: DatabaseObject) {
+        guard browser.canUseObjects, canAddQuery,
+              browser.objects.contains(where: { $0.id == object.id }) else { return }
+        browser.selectedObjectID = object.id
+        if object.kind == .table, !object.isPartition, !object.isPartitioned, let openEditing {
+            openEditing()
+        } else {
+            openQuery()
         }
     }
 
@@ -216,6 +274,13 @@ struct ObjectBrowserView: View {
                     .disabled(!browser.canUseObjects || browser.selectedObject == nil)
                     .accessibilityLabel("Copy qualified name").help("Copy qualified name")
                 }.controlSize(.small)
+                if let openEditing {
+                    Button("Edit Table Data", systemImage: "square.and.pencil", action: openEditing)
+                        .controlSize(.small)
+                        .disabled(!browser.canUseObjects || !canAddQuery || browser.selectedObject?.kind != .table
+                                  || browser.selectedObject?.isPartition != false || browser.selectedObject?.isPartitioned != false)
+                        .help("Open an editable table query using this object's connection. Choose Run to load rows.")
+                }
             }.padding(.horizontal, 12).padding(.vertical, 8)
         }
     }
@@ -229,6 +294,8 @@ struct ObjectBrowserView: View {
 
 private struct ObjectBrowserRow: View {
     let object: DatabaseObject
+    let showsSchemaAndKind: Bool
+    var modelName: String? = nil
     private var symbol: String {
         switch object.kind {
         case .table: "tablecells"
@@ -236,8 +303,8 @@ private struct ObjectBrowserRow: View {
         case .materializedView: "square.stack.3d.up"
         }
     }
-    private var details: String {
-        var labels = [object.schema, object.kind.title]
+    private var statusLabels: [String] {
+        var labels: [String] = []
         if object.isPartitioned { labels.append("Partitioned") }
         if object.isPartition { labels.append("Partition") }
         if object.isPopulated == false { labels.append("Not populated") }
@@ -245,14 +312,22 @@ private struct ObjectBrowserRow: View {
         else if !object.hasTableSelect {
             labels.append(object.hasAnyColumnSelect ? "Column access only" : "No SELECT grant")
         }
-        return labels.joined(separator: " · ")
+        return labels
+    }
+    private var details: String {
+        ([object.schema, object.kind.title] + statusLabels).joined(separator: " · ")
+    }
+    private var subtitle: String {
+        ((showsSchemaAndKind ? [object.schema, object.kind.title] : []) + statusLabels)
+            .joined(separator: " · ")
     }
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: symbol).foregroundStyle(.secondary).frame(width: 16).padding(.top, 1)
             VStack(alignment: .leading, spacing: 3) {
                 Text(object.name).lineLimit(1)
-                Text(details).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                if !subtitle.isEmpty { Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
+                if let modelName { Text(modelName).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }
             }
         }
         .padding(.vertical, 2).frame(maxWidth: .infinity, alignment: .leading)

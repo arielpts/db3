@@ -40,7 +40,7 @@ struct WorksheetCredentialRequest: Identifiable, Equatable {
     let target: ConnectionEditTarget
 }
 
-enum WorksheetCloseDecision { case save, discard, keepOpen }
+enum WorksheetCloseDecision { case save, discard, keepOpen, reviewGrid }
 
 struct WorksheetCloseSnapshot: Equatable {
     let id: UUID
@@ -53,14 +53,20 @@ struct WorksheetCloseSnapshot: Equatable {
     let transaction: TransactionState
     let activityGeneration: UUID
     let preservesDraft: Bool
+    let pendingGridCells: Int
+    let hasActiveCellEditor: Bool
+    let gridDraftRevision: UInt64
 
     @MainActor init(_ sheet: Worksheet, preservingDraft: Bool = false) {
         id = sheet.id; title = sheet.title; documentRevision = sheet.documentRevision
         isDirty = sheet.isDirty && !preservingDraft; isBusy = sheet.isBusy; isSaving = sheet.isSaving; isCancelling = sheet.isCancelling
         transaction = sheet.transaction; activityGeneration = sheet.activityGeneration
         preservesDraft = preservingDraft
+        pendingGridCells = sheet.changedCellCount; hasActiveCellEditor = sheet.hasActiveCellEditor || sheet.lookup != nil
+        gridDraftRevision = sheet.draftRevision
     }
-    var needsDecision: Bool { isDirty || isBusy || isSaving || transaction == .inTransaction || transaction == .failed }
+    var hasGridDrafts: Bool { pendingGridCells > 0 || hasActiveCellEditor }
+    var needsDecision: Bool { isDirty || isBusy || isSaving || hasGridDrafts || transaction == .inTransaction || transaction == .failed }
 }
 
 /// Injectable UI boundary: model/lifecycle tests never open dialogs or access Keychain.
@@ -102,11 +108,16 @@ struct NativeWorkbenchDialogs: WorkbenchDialogs {
         if snapshot.isDirty { consequences.append("This query has unsaved SQL changes.") }
         if snapshot.isBusy { consequences.append("Running work will be cancelled. A statement already sent to the server may have completed.") }
         if snapshot.isSaving { consequences.append("Wait for the current save to finish before closing this query.") }
+        if snapshot.hasGridDrafts { consequences.append("There are unsaved database-value drafts or an active cell editor. These values are memory-only and will be discarded on close. Preview and Apply does not commit a Manual-mode transaction.") }
         if hasTransaction {
             consequences.append("The open transaction will be rolled back when this session disconnects.")
         }
         alert.informativeText = consequences.joined(separator: "\n\n")
-        if snapshot.isDirty {
+        if snapshot.hasGridDrafts {
+            alert.addButton(withTitle: "Preview Changes")
+            alert.addButton(withTitle: "Keep Open")
+            alert.addButton(withTitle: hasTransaction ? "Discard Drafts, Roll Back and Close" : "Discard Changes and Close")
+        } else if snapshot.isDirty {
             alert.addButton(withTitle: "Save and Close")
             alert.addButton(withTitle: "Keep Open")
             alert.addButton(withTitle: "Close Without Saving")
@@ -121,6 +132,10 @@ struct NativeWorkbenchDialogs: WorkbenchDialogs {
         let response: NSApplication.ModalResponse
         if let window = NSApp.keyWindow ?? NSApp.mainWindow { response = await alert.beginSheetModal(for: window) }
         else { return .keepOpen }
+        if snapshot.hasGridDrafts {
+            if response == .alertFirstButtonReturn { return .reviewGrid }
+            return response == .alertThirdButtonReturn ? .discard : .keepOpen
+        }
         if response == .alertFirstButtonReturn { return snapshot.isDirty ? .save : .discard }
         if snapshot.isDirty, response == .alertThirdButtonReturn { return .discard }
         return .keepOpen

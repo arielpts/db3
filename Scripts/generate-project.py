@@ -27,7 +27,7 @@ sourcephase = add("sourcephase", f'isa = PBXSourcesBuildPhase; buildActionMask =
 package = add("package", 'isa = XCLocalSwiftPackageReference; relativePath = ../Packages/DB3Kit;')
 dependencies = []
 frameworks = []
-for name in ("DB3Core", "DB3Postgres", "DB3Results", "DB3Editor", "DB3Grid"):
+for name in ("DB3Core", "DB3Postgres", "DB3Results", "DB3Editor", "DB3Grid", "DB3Projects"):
     dependency = add("dep-" + name, f'isa = XCSwiftPackageProductDependency; package = {package}; productName = {name};')
     dependencies.append(dependency)
     frameworks.append(add("framework-" + name, f'isa = PBXBuildFile; productRef = {dependency};'))
@@ -47,6 +47,7 @@ for scope in ("project", "app"):
         if scope == "app": settings.update({
             "PRODUCT_NAME": "db3", "PRODUCT_BUNDLE_IDENTIFIER": "app.db3.workbench", "GENERATE_INFOPLIST_FILE": "YES",
             "INFOPLIST_KEY_CFBundleDisplayName": "db3", "INFOPLIST_KEY_LSApplicationCategoryType": "public.app-category.developer-tools",
+            "INFOPLIST_KEY_NSHumanReadableCopyright": "Author: Ariel Patschiki",
             "MARKETING_VERSION": "0.1.0", "CURRENT_PROJECT_VERSION": "1", "CODE_SIGN_STYLE": "Automatic",
             # Ad-hoc development signatures have no Team ID. Hardened runtime
             # library validation rejects our ad-hoc native dependencies at launch.

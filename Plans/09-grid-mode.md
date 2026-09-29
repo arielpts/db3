@@ -12,7 +12,7 @@ Double-click a table, view, or materialized view in the Objects sidebar. db3 ope
 
 The interaction takes inspiration from DataGrip's object data editor: SQL predicates in a WHERE field, SQL ordering in an ORDER BY field, and sorting through column headers. These controls query the database, so they can reach rows outside the displayed page. [DataGrip filtering](https://www.jetbrains.com/help/datagrip/tables-filter.html), [DataGrip sorting](https://www.jetbrains.com/help/datagrip/tables-sort.html).
 
-This task deliberately replaces task 05's rule that double-click never executes SQL **for the Open Data action only**. Single-click still selects metadata. **New SELECT Query**, the tab-row **+**, and ordinary SQL-file tabs still prepare a query without connecting or running it. Grid tabs share the existing tab row and four-tab capacity; they are not a second window or a sidebar worksheet list.
+This task deliberately replaces task 05's rule that double-click never executes SQL **for the Open Data action only**. Single-click still selects metadata. **New SELECT Query** prepares SQL and automatically connects its independent tab to the object's source, without running it. The tab-row **+** and ordinary SQL-file tabs still prepare a query without connecting or running it. Grid tabs share the existing tab row and four-database-tab capacity; they are not a second window or a sidebar worksheet list. Tasks [11](11-terminal.md)/[12](12-files-explorer.md) add terminal/file tabs under separate budgets, and [13](13-workspace-layout.md) distributes tabs across groups without increasing the database limit. Share their typed command routing and recovery migration.
 
 ## Opening and tab identity
 

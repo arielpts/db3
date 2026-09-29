@@ -47,6 +47,7 @@ public struct DatabaseObject: Identifiable, Hashable, Sendable {
     public let isPartitioned: Bool
     public let persistence: String
     public let isPopulated: Bool?
+    public let identityToken: String
     public let hasSchemaUsage: Bool
     public let hasTableSelect: Bool
     public let hasAnyColumnSelect: Bool
@@ -54,9 +55,10 @@ public struct DatabaseObject: Identifiable, Hashable, Sendable {
     public init(id: DatabaseObjectID, schemaOID: UInt32, schema: String, name: String,
                 kind: DatabaseObjectKind, isPartition: Bool = false, isPartitioned: Bool = false,
                 persistence: String = "p", isPopulated: Bool? = nil,
-                hasSchemaUsage: Bool = true, hasTableSelect: Bool = true, hasAnyColumnSelect: Bool = true) {
+                identityToken: String = "", hasSchemaUsage: Bool = true, hasTableSelect: Bool = true, hasAnyColumnSelect: Bool = true) {
         self.id = id; self.schemaOID = schemaOID; self.schema = schema; self.name = name; self.kind = kind
         self.isPartition = isPartition; self.isPartitioned = isPartitioned; self.persistence = persistence
+        self.identityToken = identityToken
         self.isPopulated = isPopulated; self.hasSchemaUsage = hasSchemaUsage
         self.hasTableSelect = hasTableSelect; self.hasAnyColumnSelect = hasAnyColumnSelect
     }
@@ -85,6 +87,31 @@ public struct CatalogCursor: Hashable, Sendable {
     }
 }
 
+/// Exact namespace membership is applied by PostgreSQL before pagination.
+/// Optional identity evidence protects user overrides from drop/recreate reuse.
+public struct CatalogMembership: Hashable, Codable, Sendable {
+    public let schema: String, relation: String
+    public let oid: UInt32?
+    public let token: String?
+    public init(schema: String, relation: String, oid: UInt32? = nil, token: String? = nil) {
+        self.schema = schema; self.relation = relation; self.oid = oid; self.token = token
+    }
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.schema.utf8.elementsEqual(rhs.schema.utf8) && lhs.relation.utf8.elementsEqual(rhs.relation.utf8)
+            && lhs.oid == rhs.oid && lhs.token == rhs.token
+    }
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(Data(schema.utf8)); hasher.combine(Data(relation.utf8)); hasher.combine(oid); hasher.combine(token)
+    }
+}
+public struct CatalogNamespaceFilter: Hashable, Sendable {
+    public var included: [CatalogMembership]?
+    public var excluded: [CatalogMembership]
+    public init(included: [CatalogMembership]? = nil, excluded: [CatalogMembership] = []) {
+        self.included = included; self.excluded = excluded
+    }
+}
+
 public struct CatalogQuery: Hashable, Sendable {
     public let search: String
     public let kind: DatabaseObjectKind?
@@ -92,9 +119,11 @@ public struct CatalogQuery: Hashable, Sendable {
     public let schema: String?
     public let cursor: CatalogCursor?
     public let limit: Int
+    public let namespaceFilter: CatalogNamespaceFilter
     public init(search: String = "", kind: DatabaseObjectKind? = nil, schema: String? = nil,
-                cursor: CatalogCursor? = nil, limit: Int = 500) {
+                cursor: CatalogCursor? = nil, limit: Int = 500, namespaceFilter: CatalogNamespaceFilter = .init()) {
         self.search = search; self.kind = kind; self.schema = schema; self.cursor = cursor; self.limit = limit
+        self.namespaceFilter = namespaceFilter
     }
 }
 

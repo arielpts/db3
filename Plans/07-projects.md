@@ -1,10 +1,10 @@
 # 07 — Projects, model metadata, and value choices
 
-**Status:** planned; no project inspection has been implemented.  
+**Status:** implemented; headless and packaging verification recorded below. Native visual/accessibility acceptance remains pending.
 **Planning date:** 2026-09-29.  
 **First project:** `~/Projects/odoo`, with an Odoo 18 inspection adapter.  
 **Depends on:** [04 — Query tabs](04-tabs.md), [05 — Objects](05-objects.md), and [06 — Editing](06-edit.md).  
-**Coordinates with:** [08 — Odoo connections](08-odoo-json-rpc.md) for application connections and ORM behavior; project inspection is independent of connection transport.
+**Coordinates with:** [08 — Odoo connections](08-odoo-json-rpc.md) for application connections and ORM behavior, [11 — Project terminal](11-terminal.md) for Shell/Claude Code/Codex sessions, [12 — Files explorer](12-files-explorer.md) for source documents, and [13 — Workspace layout](13-workspace-layout.md) for presentation. Project inspection is independent of connection transport.
 
 ## Outcome
 
@@ -19,11 +19,14 @@ User namespace changes and project preferences are saved in `.db3/project.json` 
 ## Project workspace
 
 - Add native **Open Project Folder…**, **Close Project**, and **Recent Projects** actions. Use a folder picker and a small Projects section/status area; preserve the independent query-tab and browser selections established by tasks 04/05.
-- Initially allow one active project folder per workspace. Opening another replaces project inspection after handling unsaved project-file conflicts; it does not close tabs, change their profiles, or discard staged database edits.
+- Initially allow one active project folder per workspace. Opening another replaces project inspection after handling unsaved project-file conflicts; it does not close SQL/grid tabs, change their profiles, or discard staged database edits. Tasks 11/12 add project-owned terminal/file tabs: gather their stop/save/discard decisions before closing/replacing the project, and keep the original project and tabs if any decision is cancelled or required save fails. Never retarget a running terminal or dirty file buffer to the new folder.
 - Store a durable folder reference/bookmark in Application Support, resolve stale references, and request relocation through the normal folder picker when unavailable. Retain recent-project labels and paths privately; do not persist a full source tree.
 - Show **Inspecting**, **Up to date**, **Changed**, **Partially inspected**, or **Unavailable**, with last successful refresh and actionable diagnostics. Show incomplete coverage honestly; an empty result is not a successful inspection of excluded or unreadable files.
 - Provide **Refresh Project** and **Reveal Project Settings File**. Folder inspection alone never connects to a server. Explicitly binding a project to a saved profile establishes where its metadata may be used.
 - A project may have several discovered profiles and bindings. SQL tabs, PostgreSQL object browsing, and task 08's Odoo model browsing retain their own captured connection contexts.
+- While a project is open, connection lists show only profiles associated with that project, including bindings needing review. Clear unrelated Objects selection without connecting or retargeting existing SQL tabs. Project details retain an explicit action to bind another saved profile; closing the project restores the full list.
+
+Task 11's explicit terminal launch may execute the user's shell, Claude Code, or Codex and their normal configuration. Task 12 permits explicit file editing/operations. Neither changes this task's passive inspection contract: opening or inspecting a project never executes its code. Filesystem changes from those tools use the same reconciliation and document-conflict paths as external edits.
 
 ## Shared adapter contract
 
@@ -165,4 +168,38 @@ Test empty/missing dotenv values, quoting/interpolation cycles/limits, malicious
 
 Test namespace overrides across reopen, Base toggling, search beyond first catalog page, unknown JSON keys, atomic save failure, read-only folders, external-write conflicts, orphan mappings, event storms/dropped events, branch switches, temporary syntax errors, dependency edits, closed-project late completions, and repeated project open/close without retained watchers. Verify the Odoo-only and PostgreSQL-only paths remain independently usable as task 08 lands.
 
-This is a planning task only. Implementation will run focused headless tests and local builds first; screenshots, UI-state inspection, and mouse/keyboard automation continue to require fresh explicit computer-control permission under the current user instructions.
+Implementation uses local builds and headless verification. Screenshots, UI-state inspection, and mouse/keyboard automation continue to require fresh explicit computer-control permission under the current user instructions.
+
+## Implemented behavior
+
+- Open/close/recent folder actions, private security-scoped bookmarks, restoration, relocation support, inspection status, diagnostics and settings recovery.
+- Safe grouped configuration discovery, masked review, explicit project/profile/schema binding, retained source provenance, memory-only credential change detection and stale-review rejection. Inspection never executes project code or connects to a database.
+- Embedded Tree-sitter runtime **0.25.10** and Python grammar **0.25.0**, pinned by commit/archive hash, with bundled MIT licenses. Framework-neutral immutable facts and an Odoo adapter; generic folders remain useful without an adapter.
+- Bounded source roots, import/dependency resolution, module ownership, literal selections (including EnhancedSelection tuple metadata), computed/related/storage hints, and cautious unresolved/stale handling. Model metadata is available from the object context menu.
+- Logical namespace groups, server-side namespace membership constraints before pagination, Base toggle, manual assignments and namespace display/order settings. Atomic compare-digest writes preserve unknown JSON keys. Private catalog anchors keep portable overrides from silently following replacement objects.
+- Searchable native enum/source-choice popovers or larger resizable sheets, literal search, exact UTF-8 keys, unknown current values, NULL and task-06 staging. Native enum constraints take precedence. Source changes fence an in-flight Apply before savepoint release and automatic commit.
+- FSEvents debounce (300 ms), maximum wait (1.5 s), bounded overflow rescan, focus/wake/periodic reconciliation, generation-fenced cancellation and watcher cleanup. Source parsing and filesystem work are off the main actor.
+
+## Verification and limits
+
+Synthetic tests cover constants/import aliases, enhanced tuples, dynamic refusal, inheritance and delegation, related fields, stale parsing, symlink/root boundaries, resource caps and cancellation. Configuration/settings tests cover unresolved secrets, production/TLS policy, atomic conflicts, read-only paths, unknown keys, private permissions and bookmark relocation. App tests cover restored bindings, candidate changes during review, missing portable bindings, orphan identities, exact schema matching and retained computed cautions. Disposable PostgreSQL fixtures cover namespace search before pagination, native enum changes and source changes during Apply.
+
+Native interaction, VoiceOver and live SQL-editor responsiveness during a cold project scan have not been visually verified. The 50 ms main-thread target remains an acceptance target, not a measured UI claim. Unsupported runtime declarations stay unresolved. Application/RPC execution and ORM recomputation remain task 08.
+
+Catalog anchors use relation/schema/database identity plus the `pg_class` row version. Maintenance that changes that catalog row can conservatively orphan an override even without a drop/recreate; reassign the object explicitly. There is no automatic reattachment by name alone.
+
+
+### Measured local inspection (Release, 2026-09-29)
+
+The read-only `~/Projects/odoo` scan found **7,414 candidate Python files**, parsed **7,279** before the cache limit, and published **1,331 models, 20,418 fields and 6,712 choices**. The retained metadata estimate was **67,103,232 bytes**, below the 64 MiB cap. Coverage is **partial**: resource limits and ambiguous override orders remain visible diagnostics; custom roots are prioritized. These counts describe one checkout, not the installed Odoo registry.
+
+Cold inspection took **4.218 s**, unchanged reconciliation **0.535 s**, and one explicitly invalidated-file refresh **0.528 s**, measured before the watcher's debounce. The benchmark process peaked at **142,950,400 bytes RSS**, including the test runtime and three retained snapshots; this is not a measured steady-state app footprint. An earlier full-coverage scan with looser accounting took 6.25 s, so the bounded cold figure is not a claim of complete-project performance.
+
+The embedded parser's Release C objects contribute **599,793 bytes of text/data** (about 0.57 MiB); complete object files, including other/debug sections, totaled 1,187,712 bytes. This is the parser object contribution, not an isolated signed-app size delta. Pins and both MIT notices are checked in the built app bundle.
+
+### Verification commands
+
+- `./Scripts/test.sh --integration`: disposable PostgreSQL/TLS/SCRAM fixtures plus package and application suites passed with no failures or skipped integration fixtures. No saved project connection was contacted.
+- Focused project lifecycle/binding/provider verification after the final reopen/relocation changes: **18 tests passed**.
+- Release source-inspection suite: **9 tests passed**, plus the opt-in read-only Odoo measurement above.
+- `./Scripts/build.sh`: Release build succeeded. `Scripts/verify-bundle.py` verifies the ad-hoc signature, nine bundled native libraries, portable load paths, parser pins and both parser licenses.

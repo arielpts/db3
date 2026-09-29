@@ -92,9 +92,15 @@ public actor PostgresCatalogService: CatalogService {
                 guard row.count == 1 else { throw DatabaseError("PostgreSQL returned invalid schema metadata.") }
                 return try Self.text(row[0])
             }
+            guard (query.namespaceFilter.included?.count ?? 0) + query.namespaceFilter.excluded.count <= 50_000 else {
+                throw DatabaseError("Project namespace membership exceeds its limit. Narrow the project inspection.")
+            }
+            let encoder = JSONEncoder()
+            let included = try query.namespaceFilter.included.map { String(decoding: try encoder.encode($0), as: UTF8.self) }
+            let excluded = String(decoding: try encoder.encode(query.namespaceFilter.excluded), as: UTF8.self)
             let rows = try await Self.rows(on: session, sql: Self.catalogSQL, parameters: [
                 query.search, query.kind?.rawValue, query.cursor?.schema, query.cursor?.name,
-                query.cursor.map { String($0.relationOID) }, String(query.limit + 1), query.schema
+                query.cursor.map { String($0.relationOID) }, String(query.limit + 1), query.schema, included, excluded
             ], maximumRows: query.limit + 1)
             try ensureCurrent(requestedEpoch)
             let objects = try rows.prefix(query.limit).map {
@@ -155,7 +161,7 @@ public actor PostgresCatalogService: CatalogService {
 
     private static func decode(_ row: DatabaseRow, source: CatalogSource, database: CatalogDatabaseIdentity,
                                generation: UUID) throws -> DatabaseObject {
-        guard row.count == 11,
+        guard row.count == 12,
               let relationOID = UInt32(try text(row[0])), let schemaOID = UInt32(try text(row[1])) else {
             throw DatabaseError("PostgreSQL returned invalid object metadata.")
         }
@@ -172,7 +178,7 @@ public actor PostgresCatalogService: CatalogService {
             schemaOID: schemaOID, schema: text(row[2]), name: text(row[3]), kind: kind,
             isPartition: text(row[5]) == "true", isPartitioned: relationKind == "p",
             persistence: text(row[6]), isPopulated: kind == .materializedView ? text(row[7]) == "true" : nil,
-            hasSchemaUsage: text(row[8]) == "true", hasTableSelect: text(row[9]) == "true", hasAnyColumnSelect: text(row[10]) == "true"
+            identityToken: text(row[11]), hasSchemaUsage: text(row[8]) == "true", hasTableSelect: text(row[9]) == "true", hasAnyColumnSelect: text(row[10]) == "true"
         )
     }
 
@@ -190,7 +196,7 @@ public actor PostgresCatalogService: CatalogService {
                c.relkind::text, c.relispartition::text, c.relpersistence::text, c.relispopulated::text,
                pg_catalog.has_schema_privilege(n.oid, 'USAGE')::text,
                pg_catalog.has_table_privilege(c.oid, 'SELECT')::text,
-               pg_catalog.has_any_column_privilege(c.oid, 'SELECT')::text
+               pg_catalog.has_any_column_privilege(c.oid, 'SELECT')::text, c.xmin::text
         FROM pg_catalog.pg_class AS c
         JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
         WHERE c.relkind IN ('r', 'p', 'v', 'm')
@@ -198,6 +204,18 @@ public actor PostgresCatalogService: CatalogService {
           AND n.nspname <> 'information_schema'
           AND pg_catalog.left(n.nspname::text, 3) <> 'pg_'
           AND ($7::text IS NULL OR n.nspname::text COLLATE "C" = $7::text COLLATE "C")
+          AND ($8::jsonb IS NULL OR EXISTS (
+              SELECT 1 FROM pg_catalog.jsonb_to_recordset($8::jsonb) AS member(schema text, relation text, oid bigint, token text)
+              WHERE member.schema COLLATE "C" = n.nspname::text COLLATE "C"
+                AND member.relation COLLATE "C" = c.relname::text COLLATE "C"
+                AND (member.oid IS NULL OR member.oid = c.oid::bigint)
+                AND (member.token IS NULL OR member.token = c.xmin::text)))
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_catalog.jsonb_to_recordset($9::jsonb) AS member(schema text, relation text, oid bigint, token text)
+              WHERE member.schema COLLATE "C" = n.nspname::text COLLATE "C"
+                AND member.relation COLLATE "C" = c.relname::text COLLATE "C"
+                AND (member.oid IS NULL OR member.oid = c.oid::bigint)
+                AND (member.token IS NULL OR member.token = c.xmin::text))
           AND ($1::text = ''
                OR pg_catalog.strpos(pg_catalog.lower(n.nspname::text), pg_catalog.lower($1::text)) > 0
                OR pg_catalog.strpos(pg_catalog.lower(c.relname::text), pg_catalog.lower($1::text)) > 0

@@ -10,7 +10,7 @@ let package = Package(
     targets: [
         .target(
             name: "DB3Workbench",
-            dependencies: ["DB3Core", "DB3Postgres", "DB3Results", "DB3Editor", "DB3Grid"].map {
+            dependencies: ["DB3Core", "DB3Postgres", "DB3Results", "DB3Editor", "DB3Grid", "DB3Projects"].map {
                 .product(name: $0, package: "db3kit")
             },
             path: "App/DB3App",

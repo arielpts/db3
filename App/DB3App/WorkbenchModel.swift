@@ -3,6 +3,7 @@ import Foundation
 import Observation
 import DB3Core
 import DB3Postgres
+import DB3Projects
 
 @MainActor @Observable
 final class WorkbenchModel {
@@ -13,17 +14,26 @@ final class WorkbenchModel {
         didSet {
             guard selectedBrowserProfileID != oldValue else { return }
             objectBrowser.selectProfile(selectedBrowserProfile, load: false)
-            if catalogConnectionEditIntent != nil { dismissConnectionEditor() }
+            if !isSynchronizingProject, catalogConnectionEditIntent != nil { dismissConnectionEditor() }
+            synchronizeProject()
         }
     }
     var profiles: [ConnectionProfile] = [] {
         didSet {
+            for sheet in worksheets {
+                if let saved = profiles.first(where: { $0.id == sheet.profile?.id }) { sheet.restrictEnvironment(to: saved.environment) }
+            }
             objectBrowser.synchronizeProfiles(profiles)
             if objectBrowser.selectedProfile == nil, let profile = selectedBrowserProfile {
                 objectBrowser.selectProfile(profile, load: false)
             }
+            synchronizeProject()
         }
     }
+    let project: ProjectWorkspaceModel
+    var projectConnectionCandidate: ProjectConnectionCandidate?
+    @ObservationIgnored private var lastProjectMetadataRevision: UUID?
+    @ObservationIgnored private var isSynchronizingProject = false
     let objectBrowser: ObjectBrowserModel
     var showingConnection = false
     var showingInspector = false
@@ -58,14 +68,23 @@ final class WorkbenchModel {
     }
     var canAddWorksheet: Bool { worksheets.count < Self.maximumWorksheets && !isCoordinatingClose && !isRestoringWorkspace }
     var tabLimitMessage: String { "You can open up to four query tabs. Close a tab to open another." }
-    var hasUnfinishedWork: Bool { worksheets.contains { $0.isDirty || $0.isBusy || $0.isSaving || $0.transaction == .inTransaction || $0.transaction == .failed } }
-    var selectedBrowserProfile: ConnectionProfile? { profiles.first { $0.id == selectedBrowserProfileID } }
+    var hasUnfinishedWork: Bool { worksheets.contains { $0.isDirty || $0.isBusy || $0.isSaving || $0.hasPendingGridWork || $0.transaction == .inTransaction || $0.transaction == .failed } }
+    var visibleProfiles: [ConnectionProfile] {
+        guard project.isOpen else { return profiles }
+        let ids = project.connectionProfileIDs
+        return profiles.filter { ids.contains($0.id) }
+    }
+    var selectedBrowserProfile: ConnectionProfile? { visibleProfiles.first { $0.id == selectedBrowserProfileID } }
 
-    init(persistence: any WorkbenchPersistence = LocalPersistence(), dialogs: any WorkbenchDialogs = NativeWorkbenchDialogs(), catalogService: any CatalogService = PostgresCatalogService(), workspaceStore: (any WorkspaceRecoveryPersistence)? = nil, worksheetFactory: @escaping @MainActor (String) -> Worksheet = { Worksheet(title: $0) }) {
+    init(persistence: any WorkbenchPersistence = LocalPersistence(), dialogs: any WorkbenchDialogs = NativeWorkbenchDialogs(), catalogService: any CatalogService = PostgresCatalogService(), workspaceStore: (any WorkspaceRecoveryPersistence)? = nil, project: ProjectWorkspaceModel = ProjectWorkspaceModel(), worksheetFactory: @escaping @MainActor (String) -> Worksheet = { Worksheet(title: $0) }) {
         self.persistence = persistence; self.dialogs = dialogs; self.worksheetFactory = worksheetFactory
+        self.project = project
         self.workspaceStore = workspaceStore ?? (persistence as? any WorkspaceRecoveryPersistence) ?? MemoryWorkspaceRecoveryStore()
         objectBrowser = ObjectBrowserModel(service: catalogService, credentials: { id in try await persistence.password(for: id) })
         let sheet = worksheetFactory("Query 1"); worksheets = [sheet]; selectedID = sheet.id
+        installProjectResolver(sheet)
+        project.didChange = { [weak self] in self?.synchronizeProject() }
+        objectBrowser.didLoadObjects = { [weak self] objects in self?.project.observeObjects(objects) }
     }
     func load() async {
         guard !hasLoadedWorkspace, !isRestoringWorkspace, !isCoordinatingClose else { return }
@@ -92,6 +111,7 @@ final class WorkbenchModel {
             worksheets = snapshot.tabs.map { tab in
                 let sheet = worksheetFactory(tab.title)
                 sheet.restoreWorkspace(tab)
+                installProjectResolver(sheet)
                 return sheet
             }
             selectedID = worksheets[snapshot.selectedTabIndex].id
@@ -103,15 +123,60 @@ final class WorkbenchModel {
     }
     func worksheet(id: UUID) -> Worksheet? { worksheets.first { $0.id == id && !$0.isClosed } }
     func selectBrowserProfile(_ profile: ConnectionProfile) {
-        guard profiles.contains(profile), !isCoordinatingClose else { return }
+        loadCatalogConnection(profile)
+    }
+    func loadCatalogConnection(_ profile: ConnectionProfile, password: String? = nil) {
+        guard visibleProfiles.contains(profile), !isCoordinatingClose else { return }
         selectedBrowserProfileID = profile.id
-        objectBrowser.selectProfile(profile, load: true)
+        objectBrowser.selectProfile(profile, load: false)
+        synchronizeProject()
+        if let password { objectBrowser.load(password: password) }
+        else { objectBrowser.load() }
     }
     func openSelectedObjectQuery() {
         guard let selection = objectBrowser.captureSelection() else { return }
-        _ = openQueryTab(context: QueryOpeningContext(profile: selection.profile, database: selection.database.name,
+        guard let sheet = openQueryTab(context: QueryOpeningContext(profile: selection.profile, database: selection.database.name,
             schema: selection.object.schema, object: selection.object.name),
-            sql: selection.object.selectSQL, title: selection.object.qualifiedName)
+            sql: selection.object.selectSQL, title: selection.object.qualifiedName) else { return }
+        connectObjectWorksheet(sheet, selection: selection)
+    }
+    func openSelectedObjectForEditing() {
+        guard let selection = objectBrowser.captureSelection() else { return }
+        guard selection.object.kind == .table, !selection.object.isPartition, !selection.object.isPartitioned else {
+            error = "Editing requires an ordinary table with a primary key. Views and partitioned tables remain read-only."
+            return
+        }
+        let target = WorksheetEditTarget(relationOID: selection.object.id.relationOID,
+            schema: selection.object.schema, name: selection.object.name)
+        guard let sheet = openQueryTab(context: QueryOpeningContext(profile: selection.profile, database: selection.database.name,
+            schema: target.schema, object: target.name), sql: target.initialSQL, title: target.schema + "." + target.name + " · Edit") else { return }
+        sheet.editTarget = target
+        sheet.ownedEditSQL = target.initialSQL
+        connectObjectWorksheet(sheet, selection: selection)
+    }
+    private func connectObjectWorksheet(_ sheet: Worksheet, selection: ObjectQuerySelection) {
+        guard let profile = sheet.profile else { return }
+        connectSaved(profile, in: sheet, password: objectBrowser.password(for: selection))
+    }
+    func openBaseTableForEditing(_ sheet: Worksheet, relationOID: UInt32) {
+        guard canAddWorksheet, sheet.canIssueCommands, !sheet.isBusy, let profile = sheet.profile,
+              let coordinator = sheet.managedSession else { return }
+        let token = UUID(); sheet.generation = token; sheet.isBusy = true
+        sheet.operation = Task {
+            defer { if sheet.generation == token { sheet.isBusy = false; sheet.operation = nil } }
+            do {
+                let table = try await coordinator.withExclusiveOperation { session in
+                    try await PostgresTableEditing.describe(relationOID: relationOID, on: session)
+                }
+                guard sheet.generation == token, !sheet.isClosing, !sheet.isClosed else { return }
+                if let reason = table.readOnlyReason { throw DatabaseError(reason) }
+                let target = WorksheetEditTarget(relationOID: table.relationOID, schema: table.schema, name: table.name)
+                guard let editing = openQueryTab(context: QueryOpeningContext(profile: profile, schema: table.schema, object: table.name),
+                    sql: table.selectSQL(), title: table.schema + "." + table.name + " · Edit") else { return }
+                editing.editTarget = target; editing.ownedEditSQL = editing.sql
+                connectSaved(profile, in: editing)
+            } catch { if sheet.generation == token { self.error = error.localizedDescription } }
+        }
     }
     func selectTab(_ id: UUID) { guard worksheet(id: id) != nil else { return }; selectedID = id }
     func selectTab(at index: Int) {
@@ -138,7 +203,9 @@ final class WorkbenchModel {
         sheet.title = title
     }
     private func preferredContext() -> QueryOpeningContext {
-        QueryOpeningContext(profile: selectedBrowserProfile ?? worksheets.first(where: { $0.id == selectedID })?.profile)
+        let current = worksheets.first(where: { $0.id == selectedID })?.profile
+        let fallback = !project.isOpen || visibleProfiles.contains(where: { $0.id == current?.id }) ? current : nil
+        return QueryOpeningContext(profile: selectedBrowserProfile ?? fallback)
     }
     @discardableResult private func createWorksheet(context: QueryOpeningContext, title: String? = nil) -> Worksheet? {
         guard canAddWorksheet else { error = tabLimitMessage; return nil }
@@ -146,6 +213,7 @@ final class WorkbenchModel {
         if let title { label = title }
         else { label = allocateUntitledName() }
         let sheet = worksheetFactory(label); sheet.profile = context.profile; sheet.queryContext = context
+        installProjectResolver(sheet)
         worksheets.append(sheet); selectedID = sheet.id; return sheet
     }
     private func allocateUntitledName() -> String {
@@ -163,6 +231,47 @@ final class WorkbenchModel {
         _ = createWorksheet(context: QueryOpeningContext(profile: nil))
     }
 
+    func reviewProjectCandidate(_ candidate: ProjectConnectionCandidate) {
+        guard candidate.kind == .postgresql else { return }
+        project.showingDetails = false
+        editBrowserConnection(candidate.reviewProfile())
+        if showingConnection { projectConnectionCandidate = candidate }
+    }
+    private func installProjectResolver(_ sheet: Worksheet) {
+        sheet.resolveProjectEnvironment = { [weak self] profile in self?.project.policyRestriction(for: profile) }
+        sheet.releaseProjectMetadata = { [weak self, weak sheet] in
+            guard let self, let sheet else { return }
+            await self.project.releaseProvider(worksheetID: sheet.id)
+        }
+        sheet.resolveProjectMetadata = { [weak self, weak sheet] in
+            guard let self, let sheet, let profile = sheet.profile else { return nil }
+            if let restriction = self.project.policyRestriction(for: profile) { sheet.restrictEnvironment(to: restriction) }
+            return try await self.project.provider(for: profile, worksheetID: sheet.id)
+        }
+    }
+    func synchronizeProject() {
+        guard !isSynchronizingProject else { return }
+        isSynchronizingProject = true
+        defer { isSynchronizingProject = false }
+        // Scope navigation without opening a session or retargeting existing tabs.
+        let available = visibleProfiles
+        let selected = available.first { $0.id == selectedBrowserProfileID }
+            ?? (project.isOpen ? available.first : nil)
+        if selectedBrowserProfileID != selected?.id { selectedBrowserProfileID = selected?.id }
+        if objectBrowser.selectedProfile != selected { objectBrowser.selectProfile(selected, load: false) }
+        let metadataChanged = lastProjectMetadataRevision != project.metadataRevision
+        lastProjectMetadataRevision = project.metadataRevision
+        objectBrowser.namespaceFilter = project.catalogFilter(for: objectBrowser.selectedProfile)
+        for sheet in worksheets {
+            if let profile = sheet.profile, let restriction = project.policyRestriction(for: profile) { sheet.restrictEnvironment(to: restriction) }
+            if metadataChanged, sheet.metadataProvider != nil {
+                sheet.projectMutationFence.invalidate()
+                if sheet.isApplyingEdits { sheet.operation?.cancel() }
+                sheet.invalidateEditableSnapshot()
+            }
+        }
+    }
+
     func newConnection() { presentConnectionEditor(profile: nil, in: active) }
     func newConnection(in sheet: Worksheet) { presentConnectionEditor(profile: nil, in: sheet) }
     func editConnection(_ profile: ConnectionProfile) { presentConnectionEditor(profile: profile, in: active) }
@@ -173,6 +282,7 @@ final class WorkbenchModel {
         dismissWorksheetCredentialRequests()
         if objectBrowser.isBusy || objectBrowser.credentialRequest != nil { objectBrowser.cancel() }
         connectionEditTarget = nil; catalogConnectionEditIntent = UUID()
+        projectConnectionCandidate = nil
         editingProfile = profile; showingConnection = true
     }
     private func presentConnectionEditor(profile: ConnectionProfile?, in sheet: Worksheet) {
@@ -180,6 +290,7 @@ final class WorkbenchModel {
         guard worksheet(id: sheet.id) === sheet, let intent = sheet.beginConnectionIntent() else {
             error = "Finish the active query or transaction before changing connections."; return
         }
+        projectConnectionCandidate = nil
         catalogConnectionEditIntent = nil
         connectionEditTarget = ConnectionEditTarget(worksheetID: sheet.id, intent: intent)
         editingProfile = profile; showingConnection = true
@@ -187,6 +298,7 @@ final class WorkbenchModel {
     func dismissConnectionEditor() {
         if let target = connectionEditTarget, let sheet = worksheet(id: target.worksheetID), sheet.connectionIntent == target.intent { sheet.invalidateConnectionIntent() }
         connectionEditTarget = nil; catalogConnectionEditIntent = nil; showingConnection = false
+        projectConnectionCandidate = nil
     }
     func connectWorksheet(_ sheet: Worksheet) {
         if sheet.isDemo, let profile = sheet.profile, let intent = sheet.beginConnectionIntent() {
@@ -195,7 +307,7 @@ final class WorkbenchModel {
         else { newConnection(in: sheet) }
     }
     func connectSaved(_ profile: ConnectionProfile) { connectSaved(profile, in: active) }
-    func connectSaved(_ profile: ConnectionProfile, in sheet: Worksheet) {
+    func connectSaved(_ profile: ConnectionProfile, in sheet: Worksheet, password: String? = nil) {
         dismissWorksheetCredentialRequests(for: sheet.id)
         guard worksheet(id: sheet.id) === sheet, let intent = sheet.beginConnectionIntent() else {
             error = "Finish the active query or transaction before changing connections."; return
@@ -203,9 +315,12 @@ final class WorkbenchModel {
         let id = sheet.id
         Task {
             do {
-                let password = try await persistence.password(for: profile.id)
+                let credential: String
+                if let password { credential = password }
+                else { credential = try await persistence.password(for: profile.id) }
                 guard let target = worksheet(id: id), target === sheet, target.acceptsConnectionIntent(intent) else { return }
-                target.connect(profile, password: password, intent: intent)
+                target.connect(profile, password: credential, intent: intent)
+                if let saved = profiles.first(where: { $0.id == profile.id }) { target.restrictEnvironment(to: saved.environment) }
             } catch {
                 guard let target = worksheet(id: id), target === sheet, target.acceptsConnectionIntent(intent),
                       !isCoordinatingClose, !isRestoringWorkspace, !Task.isCancelled else { return }
@@ -221,6 +336,7 @@ final class WorkbenchModel {
               sheet.acceptsConnectionIntent(request.target.intent) else { return }
         // Do not save profiles, reread Keychain, or delete its inaccessible item.
         sheet.connect(request.profile, password: password, intent: request.target.intent)
+        if let saved = profiles.first(where: { $0.id == request.profile.id }) { sheet.restrictEnvironment(to: saved.environment) }
     }
     func dismissWorksheetCredentialRequest(_ requestID: UUID) {
         guard let index = worksheetCredentialRequests.firstIndex(where: { $0.id == requestID }) else { return }
@@ -247,7 +363,7 @@ final class WorkbenchModel {
         guard worksheet(id: sheet.id) === sheet, sheet.acceptsConnectionIntent(target.intent) else { return }
         sheet.connect(profile, password: password, intent: target.intent)
     }
-    func saveCatalogConnection(profile: ConnectionProfile, password: String, remember: Bool, intent: UUID) async throws {
+    func saveCatalogConnection(profile: ConnectionProfile, password: String, remember: Bool, intent: UUID, loadObjects: Bool = true) async throws {
         guard catalogConnectionEditIntent == intent else { throw DatabaseError("This connection editor is no longer active.") }
         var updated = profiles
         if let index = updated.firstIndex(where: { $0.id == profile.id }) { updated[index] = profile }
@@ -257,11 +373,9 @@ final class WorkbenchModel {
         objectBrowser.invalidateCredentials(profileID: profile.id)
         profiles = updated
         guard catalogConnectionEditIntent == intent else { return }
-        // Select without going through the user-navigation setter while this sheet closes.
+        // Candidate review can finish its project binding before explicitly loading.
         catalogConnectionEditIntent = nil
-        selectedBrowserProfileID = profile.id
-        objectBrowser.selectProfile(profile, load: false)
-        objectBrowser.load(password: password)
+        if loadObjects { loadCatalogConnection(profile, password: password) }
     }
     func sample() { sample(in: active) }
     func sample(in sheet: Worksheet) {
@@ -282,10 +396,16 @@ final class WorkbenchModel {
     }
     @discardableResult func closeTab(id: UUID) async -> Bool { await closeTabs(ids: [id], replacingLastTab: true) }
     @discardableResult func requestCloseWorkspace() async -> Bool {
+        guard !project.unsavedSettings, !project.savingSettings else {
+            project.showingDetails = true
+            error = "Project settings have unsaved changes. Retry saving or reload the settings before quitting."
+            return false
+        }
         guard await closeTabs(ids: worksheets.map(\.id), replacingLastTab: false, preservingWorkspace: true) else { return false }
         isCoordinatingClose = true
         defer { isCoordinatingClose = false }
         await objectBrowser.shutdown()
+        await project.shutdown()
         hasLoadedWorkspace = false
         return true
     }
@@ -312,6 +432,11 @@ final class WorkbenchModel {
                 if snapshot.needsDecision {
                     let decision = await dialogs.confirmClose(snapshot)
                     guard decision != .keepOpen else { return false }
+                    if decision == .reviewGrid {
+                        selectedID = sheet.id
+                        DispatchQueue.main.async { sheet.previewChanges() }
+                        return false
+                    }
                     guard WorksheetCloseSnapshot(sheet, preservingDraft: preservingWorkspace) == snapshot else { continue review }
                     if decision == .save && !preservingWorkspace {
                         let content = sheet.sql

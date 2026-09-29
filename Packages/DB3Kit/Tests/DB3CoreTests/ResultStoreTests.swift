@@ -278,6 +278,48 @@ struct ResultStoreTests {
         await store.close()
     }
 
+    @Test func editableCSVHidesOnlyTrailingVersionAndKeepsExactVisibleValuesAcrossEvictedPages() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ResultStore(configuration: .init(residentByteLimit: 0, directory: directory, pageRowLimit: 1))
+        let exact = "123456789012345678901234567890.000000000000000001"
+        let rows: [DatabaseRow] = [
+            [.text("visible xmin, not metadata"), .text(exact), .text("internal-version-9001")],
+            [.null, .text(""), .text("internal-version-9002")],
+        ]
+        try await store.append(RowBatch(rows: rows))
+        // Even a visible column named xmin remains ordinary exported data. The
+        // version channel is identified by its trailing position, never its label.
+        let columns = [DatabaseColumn(index: 0, name: "xmin"), DatabaseColumn(index: 1, name: "amount")]
+        let destination = directory.appendingPathComponent("editable.csv")
+        #expect(try await store.exportCSV(columns: columns, to: destination, trailingMetadataColumns: 1) == 2)
+        let expected = "\"xmin\",\"amount\"\r\n\"visible xmin, not metadata\",\"\(exact)\"\r\n,\"\"\r\n"
+        #expect(try String(contentsOf: destination, encoding: .utf8) == expected)
+        #expect(try await store.rows(in: 0..<2) == rows)
+        #expect(await store.statistics().residentBytes == 0)
+        await store.close()
+    }
+
+    @Test func editableCSVRejectsMissingOrExtraMetadataWithoutReplacingDestination() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ResultStore(configuration: .init(residentByteLimit: 0, directory: directory))
+        let columns = [DatabaseColumn(index: 0, name: "visible")]
+        for row in [[DatabaseValue.text("only visible")], [.text("visible"), .text("version"), .text("unexpected")]] {
+            try await store.reset()
+            try await store.append(RowBatch(rows: [row]))
+            let destination = directory.appendingPathComponent("keep.csv")
+            try Data("existing export".utf8).write(to: destination)
+            do {
+                try await store.exportCSV(columns: columns, to: destination, trailingMetadataColumns: 1)
+                Issue.record("Expected exact editable-result shape validation")
+            } catch let error as ResultStoreError { #expect(error == .columnCount(expected: 1, actual: row.count)) }
+            #expect(try String(contentsOf: destination, encoding: .utf8) == "existing export")
+            #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).allSatisfy { !$0.hasPrefix(".db3-export-") })
+        }
+        await store.close()
+    }
+
     @Test func cancellingActiveCSVExportKeepsExistingDestination() async throws {
         let directory = directory()
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -1,6 +1,7 @@
 import SwiftUI
 import DB3Core
 import DB3Postgres
+import DB3Projects
 
 struct ConnectionSheet: View {
     private enum InputMethod: String, CaseIterable {
@@ -10,6 +11,10 @@ struct ConnectionSheet: View {
 
     let model: WorkbenchModel
     @State private var target: ConnectionEditTarget?
+    private let candidate: ProjectConnectionCandidate?
+    private let projectReview: ProjectConnectionReview?
+    @State private var reviewedProjectCandidate = false
+    @State private var bindProject = false
     private let catalogIntent: UUID?
     @Environment(\.dismiss) private var dismiss
     @State private var profile: ConnectionProfile
@@ -30,6 +35,9 @@ struct ConnectionSheet: View {
 
     init(model: WorkbenchModel, profile: ConnectionProfile?) {
         self.model = model
+        candidate = model.projectConnectionCandidate
+        projectReview = model.projectConnectionCandidate.map { model.project.captureReview($0) }
+        _password = State(initialValue: model.projectConnectionCandidate?.password.string ?? "")
         catalogIntent = model.catalogConnectionEditIntent
         _target = State(initialValue: model.connectionEditTarget)
         _profile = State(initialValue: profile ?? ConnectionProfile())
@@ -54,6 +62,17 @@ struct ConnectionSheet: View {
             .padding(.bottom, 8)
             .disabled(saving || loadingCredentials || parsingURL)
             Form {
+                if let candidate {
+                    Section("Project connection review") {
+                        Text(candidate.sourceGroup + " · " + candidate.environment.title)
+                        Text(candidate.environmentEvidence).font(.caption).foregroundStyle(.secondary)
+                        Text(candidate.tls.explanation).font(.caption).foregroundStyle(.secondary)
+                        if candidate.hasUnresolvedRequirements { Text("Some source values are missing or unresolved. Complete the fields below.").font(.caption) }
+                        Text("Password: " + candidate.password.status).font(.caption)
+                        Toggle("I reviewed the endpoint, environment, credentials and TLS", isOn: $reviewedProjectCandidate)
+                        Toggle("Bind this connection to the open project", isOn: $bindProject)
+                    }
+                }
                 Section {
                     TextField("Name", text: $profile.name)
                     if inputMethod == .url {
@@ -71,6 +90,16 @@ struct ConnectionSheet: View {
                     TextField("Default schema", text: $profile.defaultSchema, prompt: Text("public"))
                         .autocorrectionDisabled()
                     Text("Enter the exact schema name, without SQL identifier quotes. Leave empty for public. This sets the Objects filter; it does not change the SQL search path.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("Environment") {
+                    Picker("Environment", selection: $profile.environment) {
+                        Text("Unclassified").tag(ConnectionEnvironment.unknown)
+                        Text("Development").tag(ConnectionEnvironment.development)
+                        Text("Production").tag(ConnectionEnvironment.production)
+                    }
+                    .disabled(candidate?.environment == .production)
+                    Text("Connections start in Manual mode. Only development connections can opt into Auto mode for a query tab.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if inputMethod == .manual {
@@ -97,16 +126,24 @@ struct ConnectionSheet: View {
                     Task {
                         do {
                             if let catalogIntent {
-                                try await model.saveCatalogConnection(profile: connection.profile, password: connection.password, remember: savePassword, intent: catalogIntent)
+                                try await model.saveCatalogConnection(profile: connection.profile, password: connection.password, remember: savePassword, intent: catalogIntent, loadObjects: false)
                             } else {
                                 try await model.saveAndConnect(profile: connection.profile, password: connection.password, remember: savePassword, target: target)
+                            }
+                            if bindProject, let candidate {
+                                let bound = await model.project.bind(profile: connection.profile, key: candidate.sourceGroup.lowercased().replacingOccurrences(of: "_", with: "-").trimmingCharacters(in: CharacterSet(charactersIn: "-")),
+                                    schema: connection.profile.defaultSchema, candidateID: candidate.id, expectedReview: projectReview)
+                                if !bound { model.error = model.project.error ?? "The connection was saved. Review its project binding again." }
+                            }
+                            if catalogIntent != nil {
+                                model.loadCatalogConnection(connection.profile, password: connection.password)
                             }
                             model.dismissConnectionEditor()
                             dismiss()
                         }
                         catch { failure = error.localizedDescription; saving = false }
                     }
-                }.keyboardShortcut(.defaultAction).disabled(saving || loadingCredentials || resolvedConnection == nil)
+                }.keyboardShortcut(.defaultAction).disabled(saving || loadingCredentials || resolvedConnection == nil || (candidate != nil && !reviewedProjectCandidate))
             }.padding(20)
         }
         .frame(width: 560, height: 680)
@@ -140,6 +177,7 @@ struct ConnectionSheet: View {
             connection.id = profile.id
             connection.name = profile.name
             connection.defaultSchema = resolvedDefaultSchema
+            connection.environment = profile.environment
             return (connection, parsed.password ?? urlPassword)
         }
         guard !profile.host.isEmpty, !profile.database.isEmpty, !profile.username.isEmpty,

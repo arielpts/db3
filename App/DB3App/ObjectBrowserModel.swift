@@ -34,6 +34,8 @@ final class ObjectBrowserModel {
     private(set) var lastSuccess: Date?
     private(set) var errorMessage: String?
     private(set) var credentialRequest: ObjectBrowserCredentialRequest?
+    var namespaceFilter = CatalogNamespaceFilter() { didSet { if oldValue != namespaceFilter { filtersChanged() } } }
+    @ObservationIgnored var didLoadObjects: (@MainActor ([DatabaseObject]) -> Void)?
     var searchText = "" { didSet { if oldValue != searchText { filtersChanged() } } }
     var kind: DatabaseObjectKind? { didSet { if oldValue != kind { filtersChanged() } } }
     var schema: String? = "public" { didSet { if oldValue != schema { filtersChanged() } } }
@@ -172,6 +174,15 @@ final class ObjectBrowserModel {
         return ObjectQuerySelection(profile: source.profile, database: database, object: object)
     }
 
+    /// Reuse this browser's in-memory credential only for its validated source.
+    /// The object snapshot and workspace recovery remain credential-free.
+    func password(for selection: ObjectQuerySelection) -> String? {
+        guard let current = captureSelection(), current.profile == selection.profile,
+              current.database == selection.database, current.object.id == selection.object.id,
+              let sessionPassword, sessionPassword.source == selection.object.id.source else { return nil }
+        return sessionPassword.value
+    }
+
     func shutdown() async {
         disconnect()
         let generation = requestGeneration
@@ -210,7 +221,7 @@ final class ObjectBrowserModel {
         let previousDatabase = database
         let previousCatalogGeneration = catalogGeneration
         let cursor = append ? nextCursor : nil
-        let key = ObjectCatalogCache.Key(source: source, search: searchText, kind: kind, schema: schema)
+        let key = ObjectCatalogCache.Key(source: source, search: searchText, kind: kind, schema: schema, namespaceFilter: namespaceFilter)
         invalidateRequest(closeSession: false)
         let generation = requestGeneration
         let barrier = closeTask
@@ -244,7 +255,7 @@ final class ObjectBrowserModel {
                 try Task.checkCancellation()
                 guard accepts(generation, source: source) else { return }
                 let page = try await service.page(source: source, password: password,
-                    query: CatalogQuery(search: key.search, kind: key.kind, schema: key.schema, cursor: cursor))
+                    query: CatalogQuery(search: key.search, kind: key.kind, schema: key.schema, cursor: cursor, namespaceFilter: key.namespaceFilter))
                 try Task.checkCancellation()
                 guard accepts(generation, source: source) else { return }
                 guard page.database.name == source.profile.database,
@@ -260,6 +271,7 @@ final class ObjectBrowserModel {
                 sessionPassword = (source, password)
                 apply(entry, stale: false)
                 phase = .loaded; requestTask = nil
+                didLoadObjects?(objects)
             } catch {
                 guard accepts(generation, source: source) else { return }
                 requestTask = nil
@@ -313,6 +325,7 @@ private actor ObjectCatalogCache {
         let search: String
         let kind: DatabaseObjectKind?
         let schema: String?
+        let namespaceFilter: CatalogNamespaceFilter
     }
     struct Entry: Sendable {
         let objects: [DatabaseObject]

@@ -118,20 +118,54 @@ final class ScriptedWorkbenchDialogs: WorkbenchDialogs {
 actor RecordingDatabaseSession: DatabaseSession {
     struct Connection: Equatable, Sendable { let profile: ConnectionProfile; let password: String }
     private(set) var connections: [Connection] = []
+    /// Every driver command, including the coordinator's implicit controls.
+    private(set) var commands: [String] = []
+    /// Ordinary SQL only; existing result-pipeline assertions use this list.
     private(set) var queries: [String] = []
     private(set) var disconnectCount = 0
     private(set) var cancelCount = 0
     private var holdExecution = false
+    private var holdConnect = false
     private var holdDisconnect = false
     private var executionContinuation: CheckedContinuation<Void, any Error>?
+    private var connectContinuation: CheckedContinuation<Void, any Error>?
     private var disconnectContinuations: [CheckedContinuation<Void, Never>] = []
     private var transaction = TransactionState.idle
+    private var failures: [String: (DatabaseError, TransactionState?)] = [:]
 
     func connect(profile: ConnectionProfile, password: String) async throws -> SessionInfo {
         connections.append(Connection(profile: profile, password: password))
+        if holdConnect { try await withCheckedThrowingContinuation { connectContinuation = $0 } }
+        try Task.checkCancellation()
+        transaction = .idle
         return SessionInfo(serverVersion: "fake", backendPID: connections.count)
     }
     func execute(sql: String, onEvent: @escaping @Sendable (QueryEvent) async throws -> Void) async throws -> QuerySummary {
+        commands.append(sql)
+        let control = try SQLTransactionControl.classify(sql)
+        if let (error, state) = failures[sql] {
+            transaction = state ?? (transaction == .inTransaction ? .failed : transaction)
+            if control == .ordinary { queries.append(sql) }
+            throw error
+        }
+        if control != .ordinary {
+            try Task.checkCancellation()
+            let command: String
+            switch control {
+            case .begin: transaction = .inTransaction; command = "BEGIN"
+            case .commit:
+                command = transaction == .failed ? "ROLLBACK" : "COMMIT"
+                transaction = sql.uppercased().contains("AND CHAIN") ? .inTransaction : .idle
+            case .rollback:
+                transaction = sql.uppercased().contains("AND CHAIN") ? .inTransaction : .idle; command = "ROLLBACK"
+            case .rollbackToSavepoint: transaction = .inTransaction; command = "ROLLBACK"
+            case .savepoint: command = "SAVEPOINT"
+            case .releaseSavepoint: command = "RELEASE"
+            case .setTransaction: command = "SET"
+            default: throw DatabaseError("Unsupported transaction test command.")
+            }
+            return QuerySummary(command: command, rowCount: 0, transaction: transaction, elapsed: 0.01)
+        }
         queries.append(sql)
         if holdExecution { try await withCheckedThrowingContinuation { executionContinuation = $0 } }
         try Task.checkCancellation()
@@ -144,8 +178,18 @@ actor RecordingDatabaseSession: DatabaseSession {
         disconnectCount += 1
         if holdDisconnect { await withCheckedContinuation { disconnectContinuations.append($0) } }
         if let executionContinuation { self.executionContinuation = nil; executionContinuation.resume(throwing: CancellationError()) }
+        if let connectContinuation { self.connectContinuation = nil; connectContinuation.resume(throwing: CancellationError()) }
+        transaction = .unknown
     }
     func transactionState() async -> TransactionState { transaction }
+    func failExecution(of sql: String, with error: DatabaseError, state: TransactionState? = nil) { failures[sql] = (error, state) }
+    func clearExecutionFailures() { failures.removeAll() }
+    func suspendConnect() { holdConnect = true }
+    func finishConnect() {
+        holdConnect = false
+        let continuation = connectContinuation; connectContinuation = nil
+        continuation?.resume()
+    }
     func suspendExecution() { holdExecution = true }
     func finishExecution() {
         holdExecution = false

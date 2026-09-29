@@ -43,4 +43,4 @@ chmod 600 "$test_dir/auth-password"
 "$pg_bin/initdb" -D "$test_dir/auth-data" --auth-local=trust --auth-host=scram-sha-256 --pwfile="$test_dir/auth-password" --no-locale --encoding=UTF8 > "$test_dir/auth-init.log"
 "$pg_bin/pg_ctl" -D "$test_dir/auth-data" -l "$test_dir/auth-server.log" -o "-h 127.0.0.1 -p $auth_port -k $test_dir" start
 DB3_TEST_PORT="$test_port" DB3_TEST_USER="$(id -un)" DB3_TEST_DATABASE=postgres DB3_TEST_EXPECT_TLS_FAILURE=1 DB3_TEST_TLS_PORT="$tls_port" DB3_TEST_TLS_CA="$test_dir/server.crt" DB3_TEST_AUTH_PORT="$auth_port" DB3_TEST_AUTH_USER="$(id -un)" DB3_TEST_AUTH_PASSWORD="$auth_password" swift test --package-path Packages/DB3Kit
-swift test --package-path .
+DB3_TEST_PORT="$test_port" DB3_TEST_USER="$(id -un)" DB3_TEST_DATABASE=postgres swift test --package-path .

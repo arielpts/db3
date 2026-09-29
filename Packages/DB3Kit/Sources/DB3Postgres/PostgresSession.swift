@@ -378,7 +378,10 @@ private final class ConnectionOwner: @unchecked Sendable {
             guard let name = PQfname(result, index), let decoded = String(validatingCString: name) else {
                 throw DatabaseError("A PostgreSQL column name is not valid UTF-8.")
             }
-            return DatabaseColumn(index: Int(index), name: decoded, typeOID: PQftype(result, index))
+            let relation = PQftable(result, index), attribute = PQftablecol(result, index)
+            return DatabaseColumn(index: Int(index), name: decoded, typeOID: PQftype(result, index),
+                                  relationOID: relation == 0 ? nil : relation,
+                                  attributeNumber: attribute == 0 ? nil : Int(attribute))
         }
     }
 

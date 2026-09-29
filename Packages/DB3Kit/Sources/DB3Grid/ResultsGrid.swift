@@ -1,5 +1,6 @@
 import AppKit
 import CoreText
+import QuartzCore
 import DB3Core
 import SwiftUI
 
@@ -246,10 +247,21 @@ public struct ResultsGrid: NSViewRepresentable {
             columnLayoutDirty = false
             lastViewportWidth = viewport
             isApplyingColumnWidths = true
-            for (index, column) in table.tableColumns.enumerated() {
-                let width = allWidths[index]
-                if index > 0 { column.maxWidth = max(1200, viewport, width) }
-                if abs(column.width - width) >= 0.1 { column.width = width }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                context.allowsImplicitAnimation = false
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                defer { CATransaction.commit() }
+                for (index, column) in table.tableColumns.enumerated() {
+                    let width = allWidths[index]
+                    if index > 0 { column.maxWidth = max(1200, viewport, width) }
+                    if abs(column.width - width) >= 0.1 { column.width = width }
+                }
+                // Commit cell/header geometry in this nonanimated transaction,
+                // including when an enclosing SwiftUI layout is animated.
+                table.layoutSubtreeIfNeeded()
+                table.headerView?.layoutSubtreeIfNeeded()
             }
             isApplyingColumnWidths = false
             // A width change can expose a different set of virtualized columns.
@@ -264,6 +276,26 @@ public struct ResultsGrid: NSViewRepresentable {
             manualWidths[index - 1] = column.width
             columnLayoutDirty = true
             scheduleColumnLayout()
+        }
+
+        public func tableView(_ tableView: NSTableView, sizeToFitWidthOfColumn column: Int) -> CGFloat {
+            guard tableView.tableColumns.indices.contains(column) else { return 0 }
+            let target = tableView.tableColumns[column]
+            let position = column - 1
+            guard !isStopped, tableView === table, parent.columns.indices.contains(position) else { return target.width }
+
+            // AppKit identifies the column to the left of the double-clicked
+            // divider. Reuse its bounded background measurements; never scan
+            // rows or read storage synchronously in the native event handler.
+            let fitted = min(target.maxWidth, max(target.minWidth, min(480, max(headerWidths[position], contentWidths[position]))))
+            // Treat fitting as an explicit user width, even if it happens to
+            // match the current width and AppKit sends no resize notification.
+            manualWidths[position] = fitted
+            columnLayoutDirty = true
+            // Apply through our zero-animation path before AppKit assigns the
+            // returned width, so its native follow-up has no distance to animate.
+            applyColumnWidths()
+            return fitted
         }
 
         public func numberOfRows(in tableView: NSTableView) -> Int { parent.rowCount }

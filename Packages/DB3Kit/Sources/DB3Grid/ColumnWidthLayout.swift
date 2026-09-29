@@ -1,4 +1,5 @@
 /// Allocates column widths from measured content and the current viewport.
+/// Columns stop at their preferred width, leaving unused space after the grid.
 ///
 /// The preferred array determines the number of columns. Missing minimums are
 /// zero; extra minimums are ignored. Negative/nonfinite minimums become zero,
@@ -34,41 +35,6 @@ enum ColumnWidthLayout {
                 minima[index] + (desired[index] - minima[index]) * fraction
             }
         }
-        guard preferredTotal < viewport else { return desired }
-
-        // Grow every column in proportion to its content width. A zero-width
-        // preference gets unit weight so even empty columns can use free space.
-        // Process cap thresholds in order, then redistribute the remainder in
-        // one pass. This is O(n log n), including when many columns reach a cap.
-        let weights = desired.map { max(Double.leastNonzeroMagnitude, ($0 > 0 ? $0 : 1) / scale) }
-        let capacities = desired.indices.map { (caps[$0] - desired[$0]) / scale }
-        let order = desired.indices.sorted { lhs, rhs in
-            let left = capacities[lhs] / weights[lhs]
-            let right = capacities[rhs] / weights[rhs]
-            return left == right ? lhs < rhs : left < right
-        }
-        var suffixWeights = Array(repeating: 0.0, count: order.count + 1)
-        for position in order.indices.reversed() {
-            suffixWeights[position] = suffixWeights[position + 1] + weights[order[position]]
-        }
-
-        var result = desired
-        var remaining = viewport - preferredTotal
-        for position in order.indices {
-            let index = order[position]
-            let share = remaining * (weights[index] / suffixWeights[position])
-            if share >= capacities[index] {
-                result[index] = caps[index]
-                remaining = max(0, remaining - capacities[index])
-            } else {
-                for remainingPosition in position..<order.count {
-                    let column = order[remainingPosition]
-                    let growth = remaining * (weights[column] / suffixWeights[position]) * scale
-                    result[column] = min(caps[column], desired[column] + growth)
-                }
-                break
-            }
-        }
-        return result
+        return desired
     }
 }

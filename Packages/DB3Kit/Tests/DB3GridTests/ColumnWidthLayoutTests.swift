@@ -2,11 +2,18 @@ import XCTest
 @testable import DB3Grid
 
 final class ColumnWidthLayoutTests: XCTestCase {
-    func testContentAwareExpansionUsesAllColumnsProportionally() {
+    func testMultipleColumnsKeepContentWidthsWhenSpaceIsAvailable() {
         let result = ColumnWidthLayout.widths(preferred: [100, 200, 300], minimum: [50, 50, 50], available: 900)
-        assertWidths(result, [150, 300, 450])
-        XCTAssertEqual(result.reduce(0, +), 900, accuracy: 0.000_001)
-        assertWidths(ColumnWidthLayout.widths(preferred: [0.25, 0.5], minimum: [], available: 1.5), [0.5, 1])
+        assertWidths(result, [100, 200, 300])
+        XCTAssertLessThan(result.reduce(0, +), 900)
+        assertWidths(ColumnWidthLayout.widths(preferred: [0.25, 0.5], minimum: [], available: 1.5), [0.25, 0.5])
+    }
+
+    func testCountColumnRemainsCompactAsViewportGrows() {
+        // A short numeric result needs only its measured header/value width.
+        for viewport in [120.0, 500, 1800, 4000] {
+            assertWidths(ColumnWidthLayout.widths(preferred: [72], minimum: [64], available: viewport), [72])
+        }
     }
 
     func testShrinkingUsesOnlySpaceAboveEachMinimum() {
@@ -22,16 +29,16 @@ final class ColumnWidthLayoutTests: XCTestCase {
         assertWidths(ColumnWidthLayout.widths(preferred: [250, 400, 180], minimum: [100, 150, 80], available: 330), result)
     }
 
-    func testCapRedistributesRemainingSpaceAmongUncappedColumns() {
-        let result = ColumnWidthLayout.widths(preferred: [100, 300], minimum: [50, 50], available: 1800)
-        assertWidths(result, [600, 1200])
-        let several = ColumnWidthLayout.widths(preferred: [100, 200, 300], minimum: [40, 50, 60], available: 1700, maximum: 600)
-        assertWidths(several, [500, 600, 600])
+    func testMaximumCapsLongContentWithoutExpandingOtherColumns() {
+        let result = ColumnWidthLayout.widths(preferred: [100, 3000], minimum: [50, 50], available: 1800)
+        assertWidths(result, [100, 1200])
+        let several = ColumnWidthLayout.widths(preferred: [100, 700, 900], minimum: [40, 50, 60], available: 1700, maximum: 600)
+        assertWidths(several, [100, 600, 600])
     }
 
-    func testVeryWideViewportLeavesSpaceOnlyAfterEveryColumnIsCapped() {
+    func testVeryWideViewportLeavesUnusedSpaceAfterContent() {
         let result = ColumnWidthLayout.widths(preferred: [100, 300], minimum: [50, 50], available: 4000)
-        assertWidths(result, [1200, 1200])
+        assertWidths(result, [100, 300])
         XCTAssertLessThan(result.reduce(0, +), 4000)
     }
 
@@ -53,20 +60,20 @@ final class ColumnWidthLayoutTests: XCTestCase {
         XCTAssertEqual(result.count, 4)
         XCTAssertTrue(result.allSatisfy { $0.isFinite && $0 >= 0 })
         XCTAssertGreaterThanOrEqual(result[0], 60)
-        XCTAssertEqual(result.reduce(0, +), 640, accuracy: 0.000_001)
+        assertWidths(result, [60, 0, 0, 100])
         for maximum in [0.0, -1, .nan, .infinity, -.infinity] {
-            assertWidths(ColumnWidthLayout.widths(preferred: [100], minimum: [50], available: 2000, maximum: maximum), [1200])
+            assertWidths(ColumnWidthLayout.widths(preferred: [2000], minimum: [50], available: 2000, maximum: maximum), [1200])
         }
     }
 
     func testMismatchedArraysFollowPreferredColumnCount() {
         assertWidths(ColumnWidthLayout.widths(preferred: [100, 200, 300], minimum: [60], available: 0), [60, 0, 0])
-        assertWidths(ColumnWidthLayout.widths(preferred: [100], minimum: [60, 9000], available: 200), [200])
+        assertWidths(ColumnWidthLayout.widths(preferred: [100], minimum: [60, 9000], available: 200), [100])
     }
 
-    func testZeroPreferencesShareSpaceAndRespectMaximum() {
-        assertWidths(ColumnWidthLayout.widths(preferred: [0, 0, 0], minimum: [], available: 300), [100, 100, 100])
-        assertWidths(ColumnWidthLayout.widths(preferred: [0, 0], minimum: [], available: 100, maximum: 30), [30, 30])
+    func testZeroPreferencesUseOnlyTheirMinima() {
+        assertWidths(ColumnWidthLayout.widths(preferred: [0, 0, 0], minimum: [], available: 300), [0, 0, 0])
+        assertWidths(ColumnWidthLayout.widths(preferred: [0, 0], minimum: [20, 40], available: 100, maximum: 30), [20, 40])
     }
 
     func testViewportResizeCanGrowShrinkAndReturnWithoutAccumulatingWidths() {
@@ -77,20 +84,20 @@ final class ColumnWidthLayoutTests: XCTestCase {
         let contracted = ColumnWidthLayout.widths(preferred: preferred, minimum: minimum, available: 500)
         let returned = ColumnWidthLayout.widths(preferred: preferred, minimum: minimum, available: 1000)
         XCTAssertEqual(original, returned)
+        assertWidths(original, preferred)
+        assertWidths(expanded, preferred)
         for index in preferred.indices {
-            XCTAssertGreaterThan(expanded[index], original[index])
             XCTAssertLessThan(contracted[index], original[index])
             XCTAssertGreaterThanOrEqual(contracted[index], minimum[index])
         }
-        XCTAssertEqual(expanded.reduce(0, +), 1800, accuracy: 0.000_001)
         XCTAssertEqual(contracted.reduce(0, +), 500, accuracy: 0.000_001)
     }
 
-    func testManyColumnsRedistributeDeterministically() {
+    func testManyColumnsShrinkDeterministically() {
         let count = 10_000
         let preferred = (0..<count).map { Double(60 + ($0 % 40) * 20) }
         let minimum = Array(repeating: 40.0, count: count)
-        let available = 10_000_000.0
+        let available = 2_000_000.0
         let result = ColumnWidthLayout.widths(preferred: preferred, minimum: minimum, available: available)
         XCTAssertEqual(result.count, count)
         XCTAssertTrue(result.allSatisfy { $0.isFinite && $0 >= 40 && $0 <= 1200 })
